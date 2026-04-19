@@ -1,4 +1,4 @@
-package main
+package vpnclient
 
 import (
 	"crypto/hmac"
@@ -226,4 +226,16 @@ func fxaRefreshToken(refreshToken string) (*TokenResponse, error) {
 		tok.RefreshToken = refreshToken
 	}
 	return &tok, nil
+}
+
+func FxaLogin(email, password string) (*LoginResponse, error) {
+	return fxaLogin(email, password)
+}
+
+func FxaOAuthToken(sessionToken string) (*TokenResponse, error) {
+	return fxaOAuthToken(sessionToken)
+}
+
+func FxaRefreshToken(refreshToken string) (*TokenResponse, error) {
+	return fxaRefreshToken(refreshToken)
 }

@@ -1,4 +1,4 @@
-package main
+package vpnclient
 
 import (
 	"encoding/json"
@@ -67,4 +67,20 @@ func saveTokens(tok *TokenResponse) error {
 
 func deleteTokens() {
 	os.Remove(tokenFilePath())
+}
+
+func TokenFilePath() string {
+	return tokenFilePath()
+}
+
+func LoadTokens() (*SavedTokens, error) {
+	return loadTokens()
+}
+
+func SaveTokens(tok *TokenResponse) error {
+	return saveTokens(tok)
+}
+
+func DeleteTokens() {
+	deleteTokens()
 }

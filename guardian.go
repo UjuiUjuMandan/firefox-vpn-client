@@ -1,4 +1,4 @@
-package main
+package vpnclient
 
 import (
 	"encoding/base64"
@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const guardianEndpointDefault = "https://vpn.mozilla.org"
+const GuardianEndpointDefault = "https://vpn.mozilla.org"
 
 type ProxyPassClaims struct {
 	Sub string `json:"sub"`
@@ -22,10 +22,10 @@ type ProxyPassClaims struct {
 }
 
 type ProxyPassInfo struct {
-	RawToken  string
-	Claims    ProxyPassClaims
-	QuotaMax  string
-	QuotaLeft string
+	RawToken   string
+	Claims     ProxyPassClaims
+	QuotaMax   string
+	QuotaLeft  string
 	QuotaReset string
 }
 
@@ -46,7 +46,7 @@ type proxyPassResponse struct {
 
 func fetchProxyPass(endpoint, accessToken string) (*ProxyPassInfo, error) {
 	if endpoint == "" {
-		endpoint = guardianEndpointDefault
+		endpoint = GuardianEndpointDefault
 	}
 	url := strings.TrimRight(endpoint, "/") + "/api/v1/fpn/token"
 
@@ -100,7 +100,7 @@ func fetchProxyPass(endpoint, accessToken string) (*ProxyPassInfo, error) {
 
 func fetchUserInfo(endpoint, accessToken string) (*Entitlement, error) {
 	if endpoint == "" {
-		endpoint = guardianEndpointDefault
+		endpoint = GuardianEndpointDefault
 	}
 	url := strings.TrimRight(endpoint, "/") + "/api/v1/fpn/status"
 
@@ -162,4 +162,12 @@ func parseJWTClaims(token string) (*ProxyPassClaims, error) {
 		return nil, fmt.Errorf("parsing JWT claims JSON: %w", err)
 	}
 	return &claims, nil
+}
+
+func FetchProxyPass(endpoint, accessToken string) (*ProxyPassInfo, error) {
+	return fetchProxyPass(endpoint, accessToken)
+}
+
+func FetchUserInfo(endpoint, accessToken string) (*Entitlement, error) {
+	return fetchUserInfo(endpoint, accessToken)
 }

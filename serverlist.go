@@ -1,4 +1,4 @@
-package main
+package vpnclient
 
 import (
 	"encoding/json"
@@ -115,4 +115,12 @@ func printServerList(countries []Country) {
 			}
 		}
 	}
+}
+
+func FetchServerList() ([]Country, error) {
+	return fetchServerList()
+}
+
+func PrintServerList(countries []Country) {
+	printServerList(countries)
 }
