@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -18,6 +19,9 @@ import (
 	"time"
 
 	vpnclient "firefox-vpn-client"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
 	"golang.org/x/term"
 )
@@ -47,6 +51,7 @@ const (
 
 var (
 	errProxyHTTP2Unavailable = errors.New("proxy did not negotiate HTTP/2")
+	errProxyHTTP3Unavailable = errors.New("proxy did not negotiate HTTP/3")
 	errNoUsableProxySession  = errors.New("no usable upstream proxy session")
 )
 
@@ -54,10 +59,10 @@ func main() {
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
 		fmt.Fprintln(out, "Usage of proxy-demo:")
-		fmt.Fprintln(out, "  proxy-demo [-proxy https://HOST:PORT] [-listen 127.0.0.1:1080] [-print-info]")
+		fmt.Fprintln(out, "  proxy-demo [-proxy https://HOST:PORT] [-listen 127.0.0.1:1080] [-h3] [-print-info]")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "This program logs in to Firefox Accounts, fetches a VPN proxy pass, and")
-		fmt.Fprintln(out, "exposes a local SOCKS5 CONNECT proxy over a single upstream HTTP/2 connection.")
+		fmt.Fprintln(out, "exposes a local SOCKS5 CONNECT proxy over a single upstream HTTP/2 or HTTP/3 connection.")
 		fmt.Fprintln(out)
 		flag.PrintDefaults()
 	}
@@ -68,6 +73,7 @@ func main() {
 	printInfoFlag := flag.Bool("print-info", false, "Print user info, quota info, and server list, then exit")
 	proxyFlag := flag.String("proxy", "", "Upstream proxy URL or host:port; random CONNECT server if omitted")
 	timeoutFlag := flag.Duration("timeout", 20*time.Second, "Upstream dial and handshake timeout")
+	useH3Flag := flag.Bool("h3", false, "Use HTTP/3 (QUIC/UDP) instead of HTTP/2 (TCP) for the upstream connection")
 	flag.Parse()
 
 	runtimeAuth, tokenSource, countries := prepareDemoInputs(
@@ -102,12 +108,16 @@ func main() {
 		Timeout:  *timeoutFlag,
 		Auth:     runtimeAuth,
 		Pass:     pass,
+		UseH3:    *useH3Flag,
 	})
 	if err != nil {
-		if errors.Is(err, errProxyHTTP2Unavailable) {
+		switch {
+		case errors.Is(err, errProxyHTTP2Unavailable):
 			fmt.Fprintln(os.Stderr, "Error: upstream proxy does not support HTTP/2; refusing to start because this server must use a single upstream TCP connection.")
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: could not establish upstream HTTP/2 proxy session: %v\n", err)
+		case errors.Is(err, errProxyHTTP3Unavailable):
+			fmt.Fprintln(os.Stderr, "Error: upstream proxy did not negotiate HTTP/3 (h3 ALPN); the server may not support QUIC.")
+		default:
+			fmt.Fprintf(os.Stderr, "Error: could not establish upstream proxy session: %v\n", err)
 		}
 		os.Exit(1)
 	}
@@ -125,7 +135,11 @@ func main() {
 	fmt.Printf("Upstream proxy: %s\n", selectedProxy)
 	fmt.Printf("Auth source:    %s\n", tokenSource)
 	fmt.Printf("Proxy pass exp: %s\n", pass.ExpiresAt().Format(time.RFC3339))
-	fmt.Printf("Transport:      single upstream HTTP/2 TCP connection with background proxy-pass renewal\n")
+	if *useH3Flag {
+		fmt.Printf("Transport:      single upstream HTTP/3 QUIC connection with background proxy-pass renewal\n")
+	} else {
+		fmt.Printf("Transport:      single upstream HTTP/2 TCP connection with background proxy-pass renewal\n")
+	}
 
 	server := &socksServer{
 		upstream: controller,
@@ -577,6 +591,7 @@ func (s *h2ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 		reader:  resp.Body,
 		writer:  pw,
 		reqBody: pr,
+		name:    "h2-connect-stream",
 	}, nil
 }
 
@@ -595,10 +610,103 @@ func (s *h2ProxySession) Close() error {
 	return err
 }
 
+// h3ProxySession holds a single QUIC connection used for HTTP/3 CONNECT tunnels.
+type h3ProxySession struct {
+	conn      *quic.Conn
+	rt        *http3.Transport
+	proxyHost string
+	token     string
+}
+
+func newH3ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (*h3ProxySession, error) {
+	proxyHost := proxyURL.Host
+	if proxyURL.Port() == "" {
+		proxyHost = proxyURL.Hostname() + ":443"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	quicCfg := &quic.Config{
+		KeepAlivePeriod: 30 * time.Second,
+	}
+	conn, err := quic.DialAddr(ctx, proxyHost, &tls.Config{
+		ServerName: proxyURL.Hostname(),
+		MinVersion: tls.VersionTLS13,
+		NextProtos: []string{"h3"},
+	}, quicCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	if conn.ConnectionState().TLS.NegotiatedProtocol != "h3" {
+		_ = conn.CloseWithError(0, "")
+		return nil, errProxyHTTP3Unavailable
+	}
+
+	rt := &http3.Transport{
+		Dial: func(_ context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			return conn, nil
+		},
+	}
+
+	return &h3ProxySession{
+		conn:      conn,
+		rt:        rt,
+		proxyHost: proxyHost,
+		token:     token,
+	}, nil
+}
+
+func (s *h3ProxySession) OpenTunnel(authority string) (net.Conn, error) {
+	pr, pw := io.Pipe()
+	req, err := http.NewRequest(http.MethodConnect, "https://"+authority, pr)
+	if err != nil {
+		_ = pr.Close()
+		_ = pw.Close()
+		return nil, err
+	}
+	req.Host = authority
+	req.URL.Host = s.proxyHost
+	req.Header.Set("Proxy-Authorization", "Bearer "+s.token)
+
+	resp, err := s.rt.RoundTrip(req)
+	if err != nil {
+		_ = pr.Close()
+		_ = pw.Close()
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		_ = resp.Body.Close()
+		_ = pr.Close()
+		_ = pw.Close()
+		return nil, fmt.Errorf("proxy CONNECT failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	return &tunnelConn{
+		reader:  resp.Body,
+		writer:  pw,
+		reqBody: pr,
+		name:    "h3-connect-stream",
+	}, nil
+}
+
+func (s *h3ProxySession) Close() error {
+	if s.rt != nil {
+		_ = s.rt.Close()
+	}
+	if s.conn != nil {
+		return s.conn.CloseWithError(0, "")
+	}
+	return nil
+}
+
 type tunnelConn struct {
 	reader  io.ReadCloser
 	writer  *io.PipeWriter
 	reqBody *io.PipeReader
+	name    tunnelAddr
 
 	closeOnce sync.Once
 	closeErr  error
@@ -627,8 +735,8 @@ func (c *tunnelConn) Close() error {
 	return c.closeErr
 }
 
-func (c *tunnelConn) LocalAddr() net.Addr              { return tunnelAddr("h2-connect-stream") }
-func (c *tunnelConn) RemoteAddr() net.Addr             { return tunnelAddr("h2-connect-stream") }
+func (c *tunnelConn) LocalAddr() net.Addr              { return c.name }
+func (c *tunnelConn) RemoteAddr() net.Addr             { return c.name }
 func (c *tunnelConn) SetDeadline(time.Time) error      { return nil }
 func (c *tunnelConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *tunnelConn) SetWriteDeadline(time.Time) error { return nil }
@@ -651,6 +759,7 @@ type proxyControllerConfig struct {
 	Timeout  time.Duration
 	Auth     *runtimeAuth
 	Pass     *vpnclient.ProxyPassInfo
+	UseH3    bool
 }
 
 type proxyController struct {
@@ -667,19 +776,28 @@ type proxyController struct {
 }
 
 func newProxyController(cfg proxyControllerConfig) (*proxyController, error) {
-	session, err := newH2ProxySession(cfg.ProxyURL, cfg.Pass.RawToken, cfg.Timeout)
+	var factory func(token string) (proxySession, error)
+	if cfg.UseH3 {
+		factory = func(token string) (proxySession, error) {
+			return newH3ProxySession(cfg.ProxyURL, token, cfg.Timeout)
+		}
+	} else {
+		factory = func(token string) (proxySession, error) {
+			return newH2ProxySession(cfg.ProxyURL, token, cfg.Timeout)
+		}
+	}
+
+	session, err := factory(cfg.Pass.RawToken)
 	if err != nil {
 		return nil, err
 	}
 
 	return &proxyController{
-		guardian: cfg.Guardian,
-		proxyURL: cfg.ProxyURL,
-		timeout:  cfg.Timeout,
-		sessionFactory: func(token string) (proxySession, error) {
-			return newH2ProxySession(cfg.ProxyURL, token, cfg.Timeout)
-		},
-		auth: cfg.Auth,
+		guardian:       cfg.Guardian,
+		proxyURL:       cfg.ProxyURL,
+		timeout:        cfg.Timeout,
+		sessionFactory: factory,
+		auth:           cfg.Auth,
 		current: &managedSession{
 			session:   session,
 			expiresAt: cfg.Pass.ExpiresAt(),
