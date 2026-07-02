@@ -149,8 +149,12 @@ func TestConnectProxyHostsIncludesDefaultConnectServers(t *testing.T) {
 
 	countries := []vpnclient.Country{
 		{
+			Name: "United States",
+			Code: "US",
 			Cities: []vpnclient.City{
 				{
+					Name: "New York",
+					Code: "nyc",
 					Servers: []vpnclient.Server{
 						{Hostname: "default.example", Port: 443},
 						{Protocols: []vpnclient.Protocol{{Name: "connect", Host: "proto.example", Port: 8443}}},
@@ -169,6 +173,72 @@ func TestConnectProxyHostsIncludesDefaultConnectServers(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("expected %q at index %d, got %q", want[i], i, got[i])
 		}
+	}
+}
+
+func TestConnectProxyCandidatesIncludeExitMetadata(t *testing.T) {
+	t.Parallel()
+
+	countries := []vpnclient.Country{
+		{
+			Name: "Germany",
+			Code: "DE",
+			Cities: []vpnclient.City{
+				{
+					Name: "Frankfurt",
+					Code: "fra",
+					Servers: []vpnclient.Server{
+						{Protocols: []vpnclient.Protocol{{Name: "connect", Host: "de.example", Port: 443}}},
+					},
+				},
+			},
+		},
+	}
+
+	got := connectProxyCandidates(countries)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 candidate, got %d: %v", len(got), got)
+	}
+	candidate := got[0]
+	if candidate.Addr != "de.example:443" {
+		t.Fatalf("expected proxy de.example:443, got %q", candidate.Addr)
+	}
+	if candidate.CountryName != "Germany" || candidate.CountryCode != "DE" {
+		t.Fatalf("unexpected country metadata: %#v", candidate)
+	}
+	if candidate.CityName != "Frankfurt" || candidate.CityCode != "fra" {
+		t.Fatalf("unexpected city metadata: %#v", candidate)
+	}
+}
+
+func TestResolveProxyMatchesExplicitProxyMetadata(t *testing.T) {
+	t.Parallel()
+
+	countries := []vpnclient.Country{
+		{
+			Name: "Japan",
+			Code: "JP",
+			Cities: []vpnclient.City{
+				{
+					Name: "Tokyo",
+					Code: "tyo",
+					Servers: []vpnclient.Server{
+						{Hostname: "jp.example", Port: 443},
+					},
+				},
+			},
+		},
+	}
+
+	got, err := resolveProxy("https://jp.example", countries)
+	if err != nil {
+		t.Fatalf("resolveProxy returned error: %v", err)
+	}
+	if got.Addr != "https://jp.example" {
+		t.Fatalf("expected original proxy flag to be preserved, got %q", got.Addr)
+	}
+	if got.CountryCode != "JP" || got.CityCode != "tyo" {
+		t.Fatalf("expected explicit proxy metadata match, got %#v", got)
 	}
 }
 

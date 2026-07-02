@@ -149,7 +149,7 @@ func main() {
 	runtimeAuth, tokenSource, countries := prepareDemoInputs(
 		*loginFlag,
 		strings.TrimSpace(*sessionTokenFlag),
-		strings.TrimSpace(*proxyFlag) == "",
+		true,
 	)
 
 	selectedProxy, err := resolveProxy(strings.TrimSpace(*proxyFlag), countries)
@@ -158,9 +158,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	proxyURL, err := normalizeProxyURL(selectedProxy)
+	proxyURL, err := normalizeProxyURL(selectedProxy.Addr)
 	if err != nil {
-		logError("invalid proxy %q: %v", selectedProxy, err)
+		logError("invalid proxy %q: %v", selectedProxy.Addr, err)
 		os.Exit(1)
 	}
 
@@ -185,6 +185,7 @@ func main() {
 		printRuntimeInfo(*guardianFlag, runtimeAuth.Token.AccessToken, pass, countries)
 		return
 	}
+	sessionStart := time.Now()
 	controller, err := newProxyController(proxyControllerConfig{
 		Guardian: *guardianFlag,
 		ProxyURL: proxyURL,
@@ -204,6 +205,7 @@ func main() {
 		}
 		os.Exit(1)
 	}
+	localToExitLatency := time.Since(sessionStart).Round(time.Millisecond)
 	defer controller.Close()
 	go controller.runRenewalLoop()
 
@@ -216,7 +218,7 @@ func main() {
 
 	logInfo("SOCKS5 proxy started listen=%s upstream=%s auth_source=%q proxy_pass_exp=%s max_conns=%d handshake_timeout=%s connect_timeout=%s verbose=%v",
 		ln.Addr().String(),
-		selectedProxy,
+		selectedProxy.Addr,
 		tokenSource,
 		pass.ExpiresAt().Format(time.RFC3339),
 		*maxConnsFlag,
@@ -229,6 +231,14 @@ func main() {
 	} else {
 		logInfo("transport=http2 mode=single-upstream-connection renewal=background")
 	}
+	logInfo("exit selected country=%q country_code=%s city=%q city_code=%s proxy=%s local_to_exit_latency=%s",
+		selectedProxy.CountryNameOrUnknown(),
+		selectedProxy.CountryCodeOrUnknown(),
+		selectedProxy.CityNameOrUnknown(),
+		selectedProxy.CityCodeOrUnknown(),
+		selectedProxy.Addr,
+		localToExitLatency,
+	)
 
 	server := newSocksServer(controller, *handshakeTimeoutFlag, *maxConnsFlag)
 
@@ -370,20 +380,98 @@ func promptCredentials() (string, string) {
 	return strings.TrimSpace(email), string(passwordBytes)
 }
 
-func resolveProxy(proxyFlag string, countries []vpnclient.Country) (string, error) {
+type proxyCandidate struct {
+	Addr        string
+	CountryName string
+	CountryCode string
+	CityName    string
+	CityCode    string
+}
+
+func (p proxyCandidate) CountryNameOrUnknown() string {
+	if p.CountryName == "" {
+		return "unknown"
+	}
+	return p.CountryName
+}
+
+func (p proxyCandidate) CountryCodeOrUnknown() string {
+	if p.CountryCode == "" {
+		return "unknown"
+	}
+	return p.CountryCode
+}
+
+func (p proxyCandidate) CityNameOrUnknown() string {
+	if p.CityName == "" {
+		return "unknown"
+	}
+	return p.CityName
+}
+
+func (p proxyCandidate) CityCodeOrUnknown() string {
+	if p.CityCode == "" {
+		return "unknown"
+	}
+	return p.CityCode
+}
+
+func resolveProxy(proxyFlag string, countries []vpnclient.Country) (proxyCandidate, error) {
 	if proxyFlag != "" {
-		return proxyFlag, nil
+		if matched, ok := findProxyCandidate(proxyFlag, countries); ok {
+			matched.Addr = proxyFlag
+			return matched, nil
+		}
+		return proxyCandidate{Addr: proxyFlag}, nil
 	}
 
-	proxies := connectProxyHosts(countries)
+	proxies := connectProxyCandidates(countries)
 	if len(proxies) == 0 {
-		return "", fmt.Errorf("no CONNECT proxies available from server list; pass -proxy explicitly")
+		return proxyCandidate{}, fmt.Errorf("no CONNECT proxies available from server list; pass -proxy explicitly")
 	}
 	return proxies[rand.IntN(len(proxies))], nil
 }
 
+func findProxyCandidate(proxyFlag string, countries []vpnclient.Country) (proxyCandidate, bool) {
+	target, err := canonicalProxyAddr(proxyFlag)
+	if err != nil {
+		return proxyCandidate{}, false
+	}
+	for _, candidate := range connectProxyCandidates(countries) {
+		candidateAddr, err := canonicalProxyAddr(candidate.Addr)
+		if err != nil {
+			continue
+		}
+		if strings.EqualFold(candidateAddr, target) {
+			return candidate, true
+		}
+	}
+	return proxyCandidate{}, false
+}
+
+func canonicalProxyAddr(raw string) (string, error) {
+	proxyURL, err := normalizeProxyURL(raw)
+	if err != nil {
+		return "", err
+	}
+	host := proxyURL.Host
+	if proxyURL.Port() == "" {
+		host = net.JoinHostPort(proxyURL.Hostname(), "443")
+	}
+	return strings.ToLower(host), nil
+}
+
 func connectProxyHosts(countries []vpnclient.Country) []string {
-	var proxies []string
+	candidates := connectProxyCandidates(countries)
+	proxies := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		proxies = append(proxies, candidate.Addr)
+	}
+	return proxies
+}
+
+func connectProxyCandidates(countries []vpnclient.Country) []proxyCandidate {
+	var proxies []proxyCandidate
 	for _, country := range countries {
 		for _, city := range country.Cities {
 			for _, srv := range city.Servers {
@@ -391,12 +479,24 @@ func connectProxyHosts(countries []vpnclient.Country) []string {
 					continue
 				}
 				if len(srv.Protocols) == 0 && srv.Hostname != "" && srv.Port > 0 {
-					proxies = append(proxies, fmt.Sprintf("%s:%d", srv.Hostname, srv.Port))
+					proxies = append(proxies, proxyCandidate{
+						Addr:        fmt.Sprintf("%s:%d", srv.Hostname, srv.Port),
+						CountryName: country.Name,
+						CountryCode: country.Code,
+						CityName:    city.Name,
+						CityCode:    city.Code,
+					})
 					continue
 				}
 				for _, proto := range srv.Protocols {
 					if proto.Name == "connect" && proto.Host != "" && proto.Port > 0 {
-						proxies = append(proxies, fmt.Sprintf("%s:%d", proto.Host, proto.Port))
+						proxies = append(proxies, proxyCandidate{
+							Addr:        fmt.Sprintf("%s:%d", proto.Host, proto.Port),
+							CountryName: country.Name,
+							CountryCode: country.Code,
+							CityName:    city.Name,
+							CityCode:    city.Code,
+						})
 					}
 				}
 			}
