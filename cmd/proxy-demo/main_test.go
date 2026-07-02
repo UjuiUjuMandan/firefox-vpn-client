@@ -255,6 +255,53 @@ func TestSocksServerAllowsConcurrentClients(t *testing.T) {
 	}
 }
 
+func TestSocksServerRejectsWhenConnectionLimitReached(t *testing.T) {
+	t.Parallel()
+
+	server := &socksServer{connSlots: make(chan struct{}, 1)}
+	server.connSlots <- struct{}{}
+
+	client, conn := net.Pipe()
+	defer client.Close()
+
+	done := make(chan struct{})
+	go func() {
+		server.handleConn(conn)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("server did not reject connection at limit")
+	}
+
+	buf := make([]byte, 1)
+	if _, err := client.Read(buf); err == nil {
+		t.Fatal("expected client side to observe closed connection")
+	}
+}
+
+func TestSocksServerHandshakeTimeout(t *testing.T) {
+	t.Parallel()
+
+	server := &socksServer{handshakeTimeout: 20 * time.Millisecond}
+	client, conn := net.Pipe()
+	defer client.Close()
+
+	done := make(chan struct{})
+	go func() {
+		server.handleConn(conn)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("server did not close idle handshake connection")
+	}
+}
+
 type fakeProxySession struct {
 	openCount  atomic.Int32
 	closeCount atomic.Int32
@@ -284,6 +331,31 @@ func (c *fakeNetConn) RemoteAddr() net.Addr             { return tunnelAddr("fak
 func (c *fakeNetConn) SetDeadline(time.Time) error      { return nil }
 func (c *fakeNetConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *fakeNetConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestTunnelConnCloseWriteClosesRequestBody(t *testing.T) {
+	t.Parallel()
+
+	reqBody, writer := io.Pipe()
+	conn := &tunnelConn{
+		reader:  io.NopCloser(strings.NewReader("")),
+		writer:  writer,
+		reqBody: reqBody,
+		name:    "test-tunnel",
+	}
+
+	if err := conn.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite returned error: %v", err)
+	}
+
+	buf := make([]byte, 1)
+	if _, err := reqBody.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected request body EOF after CloseWrite, got %v", err)
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+}
 
 func TestProxyControllerSwapDrainsOldSession(t *testing.T) {
 	t.Parallel()
@@ -454,5 +526,34 @@ func TestProxyControllerKeepsRebuildErrorWhenSessionUnavailable(t *testing.T) {
 	}
 	if rebuilds.Load() != maxOpenTunnelRebuildRetries {
 		t.Fatalf("expected %d rebuilds, got %d", maxOpenTunnelRebuildRetries, rebuilds.Load())
+	}
+}
+
+func TestProxyControllerSkipsRebuildWhenSessionAlreadyReplaced(t *testing.T) {
+	t.Parallel()
+
+	oldSession := &fakeProxySession{}
+	newSession := &fakeProxySession{}
+	controller := &proxyController{
+		current: &managedSession{
+			session:   oldSession,
+			expiresAt: time.Now().Add(10 * time.Minute),
+			accepting: true,
+		},
+	}
+	failed := controller.current
+	controller.swapSession(newSession, time.Now().Add(20*time.Minute))
+
+	var rebuilds atomic.Int32
+	controller.refreshSession = func() error {
+		rebuilds.Add(1)
+		return nil
+	}
+
+	if err := controller.rebuildSession(failed); err != nil {
+		t.Fatalf("rebuildSession returned error: %v", err)
+	}
+	if rebuilds.Load() != 0 {
+		t.Fatalf("expected rebuild to be skipped, got %d rebuilds", rebuilds.Load())
 	}
 }

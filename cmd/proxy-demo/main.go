@@ -49,6 +49,8 @@ const (
 	proxyPassRetryDelay         = 30 * time.Second
 	oauthRefreshLead            = 2 * time.Minute
 	maxOpenTunnelRebuildRetries = 3
+	defaultHandshakeTimeout     = 10 * time.Second
+	defaultMaxConnections       = 256
 )
 
 var (
@@ -76,6 +78,8 @@ func main() {
 	printInfoFlag := flag.Bool("print-info", false, "Print user info, quota info, and server list, then exit")
 	proxyFlag := flag.String("proxy", "", "Upstream proxy URL or host:port; random CONNECT server if omitted")
 	timeoutFlag := flag.Duration("timeout", 20*time.Second, "Upstream dial and handshake timeout")
+	handshakeTimeoutFlag := flag.Duration("handshake-timeout", defaultHandshakeTimeout, "Maximum time allowed for a client SOCKS5 handshake; 0 disables the limit")
+	maxConnsFlag := flag.Int("max-conns", defaultMaxConnections, "Maximum concurrent client connections; 0 disables the limit")
 	useH3Flag := flag.Bool("h3", false, "Use HTTP/3 (QUIC/UDP) instead of HTTP/2 (TCP) for the upstream connection")
 	flag.Parse()
 
@@ -156,9 +160,7 @@ func main() {
 		fmt.Printf("Transport:      single upstream HTTP/2 TCP connection with background proxy-pass renewal\n")
 	}
 
-	server := &socksServer{
-		upstream: controller,
-	}
+	server := newSocksServer(controller, *handshakeTimeoutFlag, *maxConnsFlag)
 
 	for {
 		conn, err := ln.Accept()
@@ -374,18 +376,62 @@ func (a *runtimeAuth) accessTokenValid(now time.Time) bool {
 }
 
 type socksServer struct {
-	upstream tunnelOpener
+	upstream         tunnelOpener
+	handshakeTimeout time.Duration
+	connSlots        chan struct{}
+}
+
+func newSocksServer(upstream tunnelOpener, handshakeTimeout time.Duration, maxConns int) *socksServer {
+	var slots chan struct{}
+	if maxConns > 0 {
+		slots = make(chan struct{}, maxConns)
+	}
+	return &socksServer{
+		upstream:         upstream,
+		handshakeTimeout: handshakeTimeout,
+		connSlots:        slots,
+	}
+}
+
+func (s *socksServer) acquireConnSlot() bool {
+	if s.connSlots == nil {
+		return true
+	}
+	select {
+	case s.connSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *socksServer) releaseConnSlot() {
+	if s.connSlots == nil {
+		return
+	}
+	<-s.connSlots
 }
 
 func (s *socksServer) handleConn(conn net.Conn) {
+	if !s.acquireConnSlot() {
+		_ = conn.Close()
+		return
+	}
+	defer s.releaseConnSlot()
 	defer conn.Close()
 
+	if s.handshakeTimeout > 0 {
+		_ = conn.SetDeadline(time.Now().Add(s.handshakeTimeout))
+	}
 	target, replyCode, err := handshakeSOCKS5(conn)
 	if err != nil {
 		if replyCode != 0 {
 			_ = writeSOCKSReply(conn, replyCode, nil)
 		}
 		return
+	}
+	if s.handshakeTimeout > 0 {
+		_ = conn.SetDeadline(time.Time{})
 	}
 
 	upstreamConn, err := s.upstream.OpenTunnel(target)
@@ -793,7 +839,11 @@ type tunnelConn struct {
 	name    tunnelAddr
 
 	closeOnce sync.Once
+	readOnce  sync.Once
+	writeOnce sync.Once
 	closeErr  error
+	readErr   error
+	writeErr  error
 }
 
 func (c *tunnelConn) Read(p []byte) (int, error) {
@@ -806,17 +856,36 @@ func (c *tunnelConn) Write(p []byte) (int, error) {
 
 func (c *tunnelConn) Close() error {
 	c.closeOnce.Do(func() {
-		if c.writer != nil {
-			_ = c.writer.Close()
-		}
+		writeErr := c.CloseWrite()
 		if c.reqBody != nil {
 			_ = c.reqBody.Close()
 		}
-		if c.reader != nil {
-			c.closeErr = c.reader.Close()
+		readErr := c.CloseRead()
+		if writeErr != nil {
+			c.closeErr = writeErr
+		} else {
+			c.closeErr = readErr
 		}
 	})
 	return c.closeErr
+}
+
+func (c *tunnelConn) CloseRead() error {
+	c.readOnce.Do(func() {
+		if c.reader != nil {
+			c.readErr = c.reader.Close()
+		}
+	})
+	return c.readErr
+}
+
+func (c *tunnelConn) CloseWrite() error {
+	c.writeOnce.Do(func() {
+		if c.writer != nil {
+			c.writeErr = c.writer.Close()
+		}
+	})
+	return c.writeErr
 }
 
 func (c *tunnelConn) LocalAddr() net.Addr              { return c.name }
@@ -895,6 +964,7 @@ func newProxyController(cfg proxyControllerConfig) (*proxyController, error) {
 func (c *proxyController) OpenTunnel(authority string) (net.Conn, error) {
 	var lastErr error
 	for attempt := 0; attempt <= maxOpenTunnelRebuildRetries; attempt++ {
+		var failedSession *managedSession
 		ms, release, err := c.acquireSession()
 		if err != nil {
 			if c.isClosed() {
@@ -912,6 +982,7 @@ func (c *proxyController) OpenTunnel(authority string) (net.Conn, error) {
 				}, nil
 			}
 			lastErr = err
+			failedSession = ms
 			c.markSessionUnusable(ms)
 			release()
 		}
@@ -921,7 +992,7 @@ func (c *proxyController) OpenTunnel(authority string) (net.Conn, error) {
 		}
 
 		fmt.Fprintf(os.Stderr, "Upstream tunnel open failed: %v; rebuilding proxy session...\n", lastErr)
-		if err := c.rebuildSession(); err != nil {
+		if err := c.rebuildSession(failedSession); err != nil {
 			lastErr = fmt.Errorf("rebuilding upstream proxy session: %w", err)
 		}
 	}
@@ -1015,6 +1086,19 @@ func (c *proxyController) currentExpiry() time.Time {
 	return c.current.expiresAt
 }
 
+func (c *proxyController) hasUsableSessionOtherThan(failedSession *managedSession, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed || c.current == nil || !c.current.accepting {
+		return false
+	}
+	if failedSession != nil && c.current == failedSession {
+		return false
+	}
+	return now.Before(c.current.expiresAt)
+}
+
 func (c *proxyController) runRenewalLoop() {
 	for {
 		c.mu.Lock()
@@ -1056,11 +1140,17 @@ func (c *proxyController) renew() error {
 	return c.renewLocked()
 }
 
-func (c *proxyController) rebuildSession() error {
+func (c *proxyController) rebuildSession(failedSession *managedSession) error {
+	c.renewMu.Lock()
+	defer c.renewMu.Unlock()
+
+	if c.hasUsableSessionOtherThan(failedSession, time.Now()) {
+		return nil
+	}
 	if c.refreshSession != nil {
 		return c.refreshSession()
 	}
-	return c.renew()
+	return c.renewLocked()
 }
 
 func (c *proxyController) renewLocked() error {
