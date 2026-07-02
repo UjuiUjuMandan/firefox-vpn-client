@@ -428,6 +428,27 @@ func TestShouldRebuildProxySession(t *testing.T) {
 	}
 }
 
+func TestLogErrRedactsConnectHTTPBodyUnlessVerbose(t *testing.T) {
+	previous := verboseLogs
+	t.Cleanup(func() { verboseLogs = previous })
+
+	err := &proxyConnectHTTPError{
+		statusCode: http.StatusBadGateway,
+		status:     "502 Bad Gateway",
+		body:       "target example.com failed",
+	}
+
+	verboseLogs = false
+	if got := logErr(err); strings.Contains(got, "example.com") {
+		t.Fatalf("expected default log error to redact CONNECT body, got %q", got)
+	}
+
+	verboseLogs = true
+	if got := logErr(err); !strings.Contains(got, "example.com") {
+		t.Fatalf("expected verbose log error to keep CONNECT body, got %q", got)
+	}
+}
+
 func TestProxyControllerSwapDrainsOldSession(t *testing.T) {
 	t.Parallel()
 

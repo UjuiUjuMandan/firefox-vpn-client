@@ -58,7 +58,67 @@ var (
 	errProxyHTTP3Unavailable = errors.New("proxy did not negotiate HTTP/3")
 	errNoUsableProxySession  = errors.New("no usable upstream proxy session")
 	errTunnelDeadline        = errors.New("deadlines are not supported for HTTP CONNECT tunnel streams")
+	verboseLogs              bool
+	logMu                    sync.Mutex
 )
+
+func logEvent(level, format string, args ...any) {
+	message := fmt.Sprintf(format, args...)
+	logMu.Lock()
+	defer logMu.Unlock()
+	fmt.Fprintf(os.Stderr, "%s %-5s %s\n", time.Now().Format(time.RFC3339), level, message)
+}
+
+func logDebug(format string, args ...any) {
+	if !verboseLogs {
+		return
+	}
+	logEvent("DEBUG", format, args...)
+}
+
+func logInfo(format string, args ...any) {
+	logEvent("INFO", format, args...)
+}
+
+func logWarn(format string, args ...any) {
+	logEvent("WARN", format, args...)
+}
+
+func logError(format string, args ...any) {
+	logEvent("ERROR", format, args...)
+}
+
+func logTarget(target string) string {
+	if verboseLogs {
+		return target
+	}
+	return "<redacted; use -verbose>"
+}
+
+func logErr(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+	if verboseLogs {
+		return err.Error()
+	}
+	var connectErr *proxyConnectHTTPError
+	if errors.As(err, &connectErr) {
+		sanitized := *connectErr
+		if sanitized.body != "" {
+			sanitized.body = "<redacted; use -verbose>"
+		}
+		return sanitized.Error()
+	}
+	return err.Error()
+}
+
+func logAddr(addr net.Addr) string {
+	if addr == nil {
+		return "<unknown>"
+	}
+	return addr.String()
+}
 
 func main() {
 	flag.Usage = func() {
@@ -82,7 +142,9 @@ func main() {
 	handshakeTimeoutFlag := flag.Duration("handshake-timeout", defaultHandshakeTimeout, "Maximum time allowed for a client SOCKS5 handshake; 0 disables the limit")
 	maxConnsFlag := flag.Int("max-conns", defaultMaxConnections, "Maximum concurrent client connections; 0 disables the limit")
 	useH3Flag := flag.Bool("h3", false, "Use HTTP/3 (QUIC/UDP) instead of HTTP/2 (TCP) for the upstream connection")
+	verboseFlag := flag.Bool("verbose", false, "Enable verbose per-connection logs, including CONNECT target hosts")
 	flag.Parse()
+	verboseLogs = *verboseFlag
 
 	runtimeAuth, tokenSource, countries := prepareDemoInputs(
 		*loginFlag,
@@ -92,13 +154,13 @@ func main() {
 
 	selectedProxy, err := resolveProxy(strings.TrimSpace(*proxyFlag), countries)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error selecting proxy: %v\n", err)
+		logError("selecting proxy failed: %v", err)
 		os.Exit(1)
 	}
 
 	proxyURL, err := normalizeProxyURL(selectedProxy)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: invalid proxy: %v\n", err)
+		logError("invalid proxy %q: %v", selectedProxy, err)
 		os.Exit(1)
 	}
 
@@ -106,15 +168,16 @@ func main() {
 	if err != nil {
 		var guardianErr *vpnclient.GuardianHTTPError
 		if errors.As(err, &guardianErr) && guardianErr.StatusCode == http.StatusForbidden {
-			fmt.Fprintln(os.Stderr, "Guardian account is not activated for Firefox VPN proxy access; activating...")
+			logInfo("Guardian account is not activated for Firefox VPN proxy access; activating")
 			if _, activateErr := vpnclient.ActivateGuardian(*guardianFlag, runtimeAuth.Token.AccessToken); activateErr != nil {
-				fmt.Fprintf(os.Stderr, "Error activating Guardian account: %v\n", activateErr)
+				logError("activating Guardian account failed: %v", activateErr)
 				os.Exit(1)
 			}
+			logInfo("Guardian account activated")
 			pass, err = vpnclient.FetchProxyPass(*guardianFlag, runtimeAuth.Token.AccessToken)
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error fetching proxy pass: %v\n", err)
+			logError("fetching proxy pass failed: %v", err)
 			os.Exit(1)
 		}
 	}
@@ -133,11 +196,11 @@ func main() {
 	if err != nil {
 		switch {
 		case errors.Is(err, errProxyHTTP2Unavailable):
-			fmt.Fprintln(os.Stderr, "Error: upstream proxy does not support HTTP/2; refusing to start because this server must use a single upstream TCP connection.")
+			logError("upstream proxy does not support HTTP/2; refusing to start because this server must use a single upstream TCP connection")
 		case errors.Is(err, errProxyHTTP3Unavailable):
-			fmt.Fprintln(os.Stderr, "Error: upstream proxy did not negotiate HTTP/3 (h3 ALPN); the server may not support QUIC.")
+			logError("upstream proxy did not negotiate HTTP/3 (h3 ALPN); the server may not support QUIC")
 		default:
-			fmt.Fprintf(os.Stderr, "Error: could not establish upstream proxy session: %v\n", err)
+			logError("establishing upstream proxy session failed: %v", err)
 		}
 		os.Exit(1)
 	}
@@ -146,19 +209,25 @@ func main() {
 
 	ln, err := net.Listen("tcp", *listenFlag)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error listening on %s: %v\n", *listenFlag, err)
+		logError("listening on %s failed: %v", *listenFlag, err)
 		os.Exit(1)
 	}
 	defer ln.Close()
 
-	fmt.Printf("SOCKS5 listen:  %s\n", ln.Addr().String())
-	fmt.Printf("Upstream proxy: %s\n", selectedProxy)
-	fmt.Printf("Auth source:    %s\n", tokenSource)
-	fmt.Printf("Proxy pass exp: %s\n", pass.ExpiresAt().Format(time.RFC3339))
+	logInfo("SOCKS5 proxy started listen=%s upstream=%s auth_source=%q proxy_pass_exp=%s max_conns=%d handshake_timeout=%s connect_timeout=%s verbose=%v",
+		ln.Addr().String(),
+		selectedProxy,
+		tokenSource,
+		pass.ExpiresAt().Format(time.RFC3339),
+		*maxConnsFlag,
+		handshakeTimeoutFlag.String(),
+		timeoutFlag.String(),
+		verboseLogs,
+	)
 	if *useH3Flag {
-		fmt.Printf("Transport:      single upstream HTTP/3 QUIC connection with background proxy-pass renewal\n")
+		logInfo("transport=http3 mode=single-upstream-connection renewal=background")
 	} else {
-		fmt.Printf("Transport:      single upstream HTTP/2 TCP connection with background proxy-pass renewal\n")
+		logInfo("transport=http2 mode=single-upstream-connection renewal=background")
 	}
 
 	server := newSocksServer(controller, *handshakeTimeoutFlag, *maxConnsFlag)
@@ -166,7 +235,7 @@ func main() {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Accept error: %v\n", err)
+			logWarn("accept failed: %v", err)
 			continue
 		}
 		go server.handleConn(conn)
@@ -193,7 +262,7 @@ func prepareDemoInputs(forceLogin bool, sessionToken string, needServerList bool
 	}
 
 	if err := vpnclient.SaveTokens(token); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not save tokens: %v\n", err)
+		logWarn("saving tokens failed: %v", err)
 	}
 
 	var countries []vpnclient.Country
@@ -201,7 +270,7 @@ func prepareDemoInputs(forceLogin bool, sessionToken string, needServerList bool
 	if needServerList {
 		countries, err = vpnclient.FetchServerList()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not fetch server list: %v\n", err)
+			logWarn("fetching server list failed: %v", err)
 		}
 	}
 
@@ -256,7 +325,7 @@ func obtainOAuthToken(forceLogin bool) (*vpnclient.TokenResponse, string) {
 			token, err := vpnclient.FxaRefreshToken(saved.RefreshToken)
 			if err != nil {
 				fmt.Printf("failed: %v\n", err)
-				fmt.Fprintln(os.Stderr, "Saved tokens were preserved. Retry by restarting the program, or use -login to force a fresh login.")
+				logWarn("saved tokens were preserved; retry by restarting the program, or use -login to force a fresh login")
 				os.Exit(1)
 			}
 			fmt.Println("OK")
@@ -295,7 +364,7 @@ func promptCredentials() (string, string) {
 	passwordBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Println()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading password: %v\n", err)
+		logError("reading password failed: %v", err)
 		os.Exit(1)
 	}
 	return strings.TrimSpace(email), string(passwordBytes)
@@ -414,39 +483,54 @@ func (s *socksServer) releaseConnSlot() {
 }
 
 func (s *socksServer) handleConn(conn net.Conn) {
+	start := time.Now()
+	clientAddr := logAddr(conn.RemoteAddr())
 	if !s.acquireConnSlot() {
+		logWarn("client rejected: connection limit reached client=%s", clientAddr)
 		_ = conn.Close()
 		return
 	}
 	defer s.releaseConnSlot()
 	defer conn.Close()
+	logDebug("client connected client=%s", clientAddr)
 
 	if s.handshakeTimeout > 0 {
 		_ = conn.SetDeadline(time.Now().Add(s.handshakeTimeout))
 	}
 	target, replyCode, err := handshakeSOCKS5(conn)
 	if err != nil {
+		logDebug("SOCKS5 handshake failed client=%s reply=%d err=%v", clientAddr, replyCode, err)
 		if replyCode != 0 {
-			_ = writeSOCKSReply(conn, replyCode, nil)
+			if writeErr := writeSOCKSReply(conn, replyCode, nil); writeErr != nil {
+				logDebug("SOCKS5 handshake failure reply failed client=%s reply=%d err=%v", clientAddr, replyCode, writeErr)
+			}
 		}
 		return
 	}
 	if s.handshakeTimeout > 0 {
 		_ = conn.SetDeadline(time.Time{})
 	}
+	logDebug("SOCKS5 CONNECT requested client=%s target=%s", clientAddr, logTarget(target))
 
 	upstreamConn, err := s.upstream.OpenTunnel(target)
 	if err != nil {
-		_ = writeSOCKSReply(conn, mapUpstreamError(err), nil)
+		reply := mapUpstreamError(err)
+		logWarn("upstream tunnel open failed client=%s target=%s reply=%d err=%s", clientAddr, logTarget(target), reply, logErr(err))
+		if writeErr := writeSOCKSReply(conn, reply, nil); writeErr != nil {
+			logDebug("SOCKS5 upstream failure reply failed client=%s target=%s reply=%d err=%v", clientAddr, logTarget(target), reply, writeErr)
+		}
 		return
 	}
 	defer upstreamConn.Close()
 
 	if err := writeSOCKSReply(conn, socksReplySuccess, conn.LocalAddr()); err != nil {
+		logDebug("SOCKS5 success reply failed client=%s target=%s err=%v", clientAddr, logTarget(target), err)
 		return
 	}
 
+	logDebug("upstream tunnel open succeeded client=%s target=%s", clientAddr, logTarget(target))
 	proxyBidirectional(conn, upstreamConn)
+	logDebug("client disconnected client=%s target=%s duration=%s", clientAddr, logTarget(target), time.Since(start).Round(time.Millisecond))
 }
 
 func handshakeSOCKS5(conn net.Conn) (string, byte, error) {
@@ -727,6 +811,7 @@ func newH2ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (
 		_ = proxyTLS.Close()
 		return nil, err
 	}
+	logInfo("upstream HTTP/2 session established proxy=%s", proxyHost)
 
 	return &h2ProxySession{
 		raw:       proxyTLS,
@@ -871,6 +956,7 @@ func newH3ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (
 		_ = udpConn.Close()
 		return nil, errProxyHTTP3Unavailable
 	}
+	logInfo("upstream HTTP/3 session established proxy=%s remote=%s", proxyHost, conn.RemoteAddr())
 
 	rt := &http3.Transport{
 		Dial: func(_ context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
@@ -1110,7 +1196,7 @@ func (c *proxyController) OpenTunnel(authority string) (net.Conn, error) {
 			break
 		}
 
-		fmt.Fprintf(os.Stderr, "Upstream tunnel open failed: %v; rebuilding proxy session...\n", lastErr)
+		logWarn("upstream tunnel open failed; rebuilding proxy session attempt=%d max=%d err=%s", attempt+1, maxOpenTunnelRebuildRetries, logErr(lastErr))
 		if err := c.rebuildSession(failedSession); err != nil {
 			lastErr = fmt.Errorf("rebuilding upstream proxy session: %w", err)
 		}
@@ -1232,8 +1318,9 @@ func (c *proxyController) runRenewalLoop() {
 		}
 		if err := c.renew(); err != nil {
 			now := time.Now()
-			fmt.Fprintf(os.Stderr, "Proxy pass renewal failed: %v\n", err)
+			logWarn("proxy pass renewal failed: %s", logErr(err))
 			c.disableExpiredSession(now)
+			logDebug("proxy pass renewal retry scheduled delay=%s", proxyPassRetryDelay)
 			time.Sleep(proxyPassRetryDelay)
 			continue
 		}
@@ -1264,6 +1351,7 @@ func (c *proxyController) rebuildSession(failedSession *managedSession) error {
 	defer c.renewMu.Unlock()
 
 	if c.hasUsableSessionOtherThan(failedSession, time.Now()) {
+		logDebug("skipping proxy session rebuild: another usable session is already active")
 		return nil
 	}
 	if c.refreshSession != nil {
@@ -1284,9 +1372,11 @@ func (c *proxyController) renewLocked() error {
 		if !errors.As(err, &guardianErr) || guardianErr.StatusCode != http.StatusForbidden {
 			return err
 		}
+		logInfo("Guardian account requires activation during proxy pass renewal; activating")
 		if _, activateErr := vpnclient.ActivateGuardian(c.guardian, auth.Token.AccessToken); activateErr != nil {
 			return activateErr
 		}
+		logInfo("Guardian account activated during proxy pass renewal")
 		pass, err = vpnclient.FetchProxyPass(c.guardian, auth.Token.AccessToken)
 		if err != nil {
 			return err
@@ -1299,7 +1389,7 @@ func (c *proxyController) renewLocked() error {
 	}
 
 	c.swapSession(session, pass.ExpiresAt())
-	fmt.Fprintf(os.Stderr, "Proxy pass renewed successfully; next expiry %s\n", pass.ExpiresAt().Format(time.RFC3339))
+	logInfo("proxy pass renewed successfully next_expiry=%s", pass.ExpiresAt().Format(time.RFC3339))
 	return nil
 }
 
@@ -1316,6 +1406,7 @@ func (c *proxyController) ensureOAuthToken() (*runtimeAuth, error) {
 		return nil, fmt.Errorf("no refresh token available for background renewal")
 	}
 
+	logInfo("refreshing OAuth token")
 	token, err := vpnclient.FxaRefreshToken(auth.Token.RefreshToken)
 	if err != nil {
 		return nil, err
@@ -1326,12 +1417,13 @@ func (c *proxyController) ensureOAuthToken() (*runtimeAuth, error) {
 		ObtainedAt: now,
 	}
 	if err := vpnclient.SaveTokens(token); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not save refreshed tokens: %v\n", err)
+		logWarn("saving refreshed tokens failed: %v", err)
 	}
 
 	c.mu.Lock()
 	c.auth = refreshed
 	c.mu.Unlock()
+	logInfo("OAuth token refreshed")
 	return refreshed, nil
 }
 
