@@ -98,8 +98,19 @@ func main() {
 
 	pass, err := vpnclient.FetchProxyPass(*guardianFlag, runtimeAuth.Token.AccessToken)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error fetching proxy pass: %v\n", err)
-		os.Exit(1)
+		var guardianErr *vpnclient.GuardianHTTPError
+		if errors.As(err, &guardianErr) && guardianErr.StatusCode == http.StatusForbidden {
+			fmt.Fprintln(os.Stderr, "Guardian account is not activated for Firefox VPN proxy access; activating...")
+			if _, activateErr := vpnclient.ActivateGuardian(*guardianFlag, runtimeAuth.Token.AccessToken); activateErr != nil {
+				fmt.Fprintf(os.Stderr, "Error activating Guardian account: %v\n", activateErr)
+				os.Exit(1)
+			}
+			pass, err = vpnclient.FetchProxyPass(*guardianFlag, runtimeAuth.Token.AccessToken)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error fetching proxy pass: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	if *printInfoFlag {
 		printRuntimeInfo(*guardianFlag, runtimeAuth.Token.AccessToken, pass, countries)
@@ -1009,7 +1020,17 @@ func (c *proxyController) renew() error {
 
 	pass, err := vpnclient.FetchProxyPass(c.guardian, auth.Token.AccessToken)
 	if err != nil {
-		return err
+		var guardianErr *vpnclient.GuardianHTTPError
+		if !errors.As(err, &guardianErr) || guardianErr.StatusCode != http.StatusForbidden {
+			return err
+		}
+		if _, activateErr := vpnclient.ActivateGuardian(c.guardian, auth.Token.AccessToken); activateErr != nil {
+			return activateErr
+		}
+		pass, err = vpnclient.FetchProxyPass(c.guardian, auth.Token.AccessToken)
+		if err != nil {
+			return err
+		}
 	}
 
 	session, err := c.sessionFactory(pass.RawToken)

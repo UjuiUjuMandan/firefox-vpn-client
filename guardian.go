@@ -35,13 +35,24 @@ func (p *ProxyPassInfo) ExpiresAt() time.Time { return time.Unix(p.Claims.Exp, 0
 func (p *ProxyPassInfo) BearerToken() string { return "Bearer " + p.RawToken }
 
 type Entitlement struct {
-	Subscribed bool   `json:"subscribed"`
-	UID        int    `json:"uid"`
-	MaxBytes   string `json:"maxBytes"`
+	Subscribed       bool   `json:"subscribed"`
+	UID              int    `json:"uid"`
+	MaxBytes         string `json:"maxBytes"`
+	LimitedBandwidth bool   `json:"limited_bandwidth"`
 }
 
 type proxyPassResponse struct {
 	Token string `json:"token"`
+}
+
+type GuardianHTTPError struct {
+	Operation  string
+	StatusCode int
+	Body       string
+}
+
+func (e *GuardianHTTPError) Error() string {
+	return fmt.Sprintf("%s returned HTTP %d: %s", e.Operation, e.StatusCode, e.Body)
 }
 
 func fetchProxyPass(endpoint, accessToken string) (*ProxyPassInfo, error) {
@@ -73,7 +84,11 @@ func fetchProxyPass(endpoint, accessToken string) (*ProxyPassInfo, error) {
 		return nil, fmt.Errorf("quota exceeded (HTTP 429): %s", string(body))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("guardian returned HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, &GuardianHTTPError{
+			Operation:  "guardian",
+			StatusCode: resp.StatusCode,
+			Body:       string(body),
+		}
 	}
 
 	var passResp proxyPassResponse
@@ -125,12 +140,56 @@ func fetchUserInfo(endpoint, accessToken string) (*Entitlement, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("guardian user info returned HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, &GuardianHTTPError{
+			Operation:  "guardian user info",
+			StatusCode: resp.StatusCode,
+			Body:       string(body),
+		}
 	}
 
 	var ent Entitlement
 	if err := json.Unmarshal(body, &ent); err != nil {
 		return nil, fmt.Errorf("parsing entitlement: %w", err)
+	}
+	return &ent, nil
+}
+
+func activateGuardian(endpoint, accessToken string) (*Entitlement, error) {
+	if endpoint == "" {
+		endpoint = GuardianEndpointDefault
+	}
+	url := strings.TrimRight(endpoint, "/") + "/api/v1/fpn/activate"
+
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	applyMozillaVPNHeaders(req)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("guardian activate request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, &GuardianHTTPError{
+			Operation:  "guardian activate",
+			StatusCode: resp.StatusCode,
+			Body:       string(body),
+		}
+	}
+
+	var ent Entitlement
+	if err := json.Unmarshal(body, &ent); err != nil {
+		return nil, fmt.Errorf("parsing activation entitlement: %w", err)
 	}
 	return &ent, nil
 }
@@ -172,4 +231,8 @@ func FetchProxyPass(endpoint, accessToken string) (*ProxyPassInfo, error) {
 
 func FetchUserInfo(endpoint, accessToken string) (*Entitlement, error) {
 	return fetchUserInfo(endpoint, accessToken)
+}
+
+func ActivateGuardian(endpoint, accessToken string) (*Entitlement, error) {
+	return activateGuardian(endpoint, accessToken)
 }
