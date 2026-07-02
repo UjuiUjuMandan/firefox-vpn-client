@@ -57,6 +57,7 @@ var (
 	errProxyHTTP2Unavailable = errors.New("proxy did not negotiate HTTP/2")
 	errProxyHTTP3Unavailable = errors.New("proxy did not negotiate HTTP/3")
 	errNoUsableProxySession  = errors.New("no usable upstream proxy session")
+	errTunnelDeadline        = errors.New("deadlines are not supported for HTTP CONNECT tunnel streams")
 )
 
 func main() {
@@ -575,6 +576,100 @@ func mapUpstreamError(err error) byte {
 	return socksReplyFailure
 }
 
+type tunnelOpenTimeoutError struct {
+	timeout time.Duration
+}
+
+func (e *tunnelOpenTimeoutError) Error() string {
+	return fmt.Sprintf("proxy CONNECT timed out after %s", e.timeout)
+}
+
+func (e *tunnelOpenTimeoutError) Timeout() bool {
+	return true
+}
+
+func (e *tunnelOpenTimeoutError) Temporary() bool {
+	return true
+}
+
+type proxyConnectHTTPError struct {
+	statusCode int
+	status     string
+	body       string
+}
+
+func (e *proxyConnectHTTPError) Error() string {
+	if e.body == "" {
+		return fmt.Sprintf("proxy CONNECT failed: %s", e.status)
+	}
+	return fmt.Sprintf("proxy CONNECT failed: %s: %s", e.status, e.body)
+}
+
+func shouldRebuildProxySession(err error) bool {
+	var connectErr *proxyConnectHTTPError
+	if errors.As(err, &connectErr) {
+		switch connectErr.statusCode {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusProxyAuthRequired:
+			return true
+		default:
+			return false
+		}
+	}
+	var timeoutErr *tunnelOpenTimeoutError
+	if errors.As(err, &timeoutErr) {
+		return false
+	}
+	return true
+}
+
+type roundTripResult struct {
+	resp *http.Response
+	err  error
+}
+
+func roundTripWithOpenTimeout(timeout time.Duration, do func(context.Context) (*http.Response, error)) (*http.Response, context.CancelFunc, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	if timeout <= 0 {
+		resp, err := do(ctx)
+		if err != nil {
+			cancel()
+			return nil, nil, err
+		}
+		return resp, cancel, nil
+	}
+
+	resultCh := make(chan roundTripResult, 1)
+	go func() {
+		resp, err := do(ctx)
+		resultCh <- roundTripResult{resp: resp, err: err}
+	}()
+
+	timer := time.NewTimer(timeout)
+	select {
+	case result := <-resultCh:
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		if result.err != nil {
+			cancel()
+			return nil, nil, result.err
+		}
+		return result.resp, cancel, nil
+	case <-timer.C:
+		cancel()
+		go func() {
+			result := <-resultCh
+			if result.resp != nil && result.resp.Body != nil {
+				_ = result.resp.Body.Close()
+			}
+		}()
+		return nil, nil, &tunnelOpenTimeoutError{timeout: timeout}
+	}
+}
+
 func proxyBidirectional(clientConn, upstreamConn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -603,6 +698,7 @@ type h2ProxySession struct {
 	cc        *http2.ClientConn
 	proxyHost string
 	token     string
+	timeout   time.Duration
 }
 
 func newH2ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (*h2ProxySession, error) {
@@ -637,20 +733,22 @@ func newH2ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (
 		cc:        cc,
 		proxyHost: proxyHost,
 		token:     token,
+		timeout:   timeout,
 	}, nil
 }
 
 func (s *h2ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 	pr, pw := io.Pipe()
-	req, err := http.NewRequest(http.MethodConnect, "http://"+authority, pr)
-	if err != nil {
-		return nil, err
-	}
-	req.Host = authority
-	req.URL.Host = s.proxyHost
-	req.Header.Set("Proxy-Authorization", "Bearer "+s.token)
-
-	resp, err := s.cc.RoundTrip(req)
+	resp, cancel, err := roundTripWithOpenTimeout(s.timeout, func(ctx context.Context) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "http://"+authority, pr)
+		if err != nil {
+			return nil, err
+		}
+		req.Host = authority
+		req.URL.Host = s.proxyHost
+		req.Header.Set("Proxy-Authorization", "Bearer "+s.token)
+		return s.cc.RoundTrip(req)
+	})
 	if err != nil {
 		_ = pr.Close()
 		_ = pw.Close()
@@ -659,9 +757,14 @@ func (s *h2ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		_ = resp.Body.Close()
+		cancel()
 		_ = pr.Close()
 		_ = pw.Close()
-		return nil, fmt.Errorf("proxy CONNECT failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil, &proxyConnectHTTPError{
+			statusCode: resp.StatusCode,
+			status:     resp.Status,
+			body:       strings.TrimSpace(string(body)),
+		}
 	}
 
 	return &tunnelConn{
@@ -669,6 +772,7 @@ func (s *h2ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 		writer:  pw,
 		reqBody: pr,
 		name:    "h2-connect-stream",
+		cancel:  cancel,
 	}, nil
 }
 
@@ -694,6 +798,7 @@ type h3ProxySession struct {
 	rt        *http3.Transport
 	proxyHost string
 	token     string
+	timeout   time.Duration
 }
 
 func newH3ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (*h3ProxySession, error) {
@@ -779,22 +884,22 @@ func newH3ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (
 		rt:        rt,
 		proxyHost: proxyHost,
 		token:     token,
+		timeout:   timeout,
 	}, nil
 }
 
 func (s *h3ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 	pr, pw := io.Pipe()
-	req, err := http.NewRequest(http.MethodConnect, "https://"+authority, pr)
-	if err != nil {
-		_ = pr.Close()
-		_ = pw.Close()
-		return nil, err
-	}
-	req.Host = authority
-	req.URL.Host = s.proxyHost
-	req.Header.Set("Proxy-Authorization", "Bearer "+s.token)
-
-	resp, err := s.rt.RoundTrip(req)
+	resp, cancel, err := roundTripWithOpenTimeout(s.timeout, func(ctx context.Context) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "https://"+authority, pr)
+		if err != nil {
+			return nil, err
+		}
+		req.Host = authority
+		req.URL.Host = s.proxyHost
+		req.Header.Set("Proxy-Authorization", "Bearer "+s.token)
+		return s.rt.RoundTrip(req)
+	})
 	if err != nil {
 		_ = pr.Close()
 		_ = pw.Close()
@@ -803,9 +908,14 @@ func (s *h3ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		_ = resp.Body.Close()
+		cancel()
 		_ = pr.Close()
 		_ = pw.Close()
-		return nil, fmt.Errorf("proxy CONNECT failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil, &proxyConnectHTTPError{
+			statusCode: resp.StatusCode,
+			status:     resp.Status,
+			body:       strings.TrimSpace(string(body)),
+		}
 	}
 
 	return &tunnelConn{
@@ -813,6 +923,7 @@ func (s *h3ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 		writer:  pw,
 		reqBody: pr,
 		name:    "h3-connect-stream",
+		cancel:  cancel,
 	}, nil
 }
 
@@ -836,6 +947,7 @@ type tunnelConn struct {
 	reader  io.ReadCloser
 	writer  *io.PipeWriter
 	reqBody *io.PipeReader
+	cancel  context.CancelFunc
 	name    tunnelAddr
 
 	closeOnce sync.Once
@@ -861,6 +973,9 @@ func (c *tunnelConn) Close() error {
 			_ = c.reqBody.Close()
 		}
 		readErr := c.CloseRead()
+		if c.cancel != nil {
+			c.cancel()
+		}
 		if writeErr != nil {
 			c.closeErr = writeErr
 		} else {
@@ -890,9 +1005,9 @@ func (c *tunnelConn) CloseWrite() error {
 
 func (c *tunnelConn) LocalAddr() net.Addr              { return c.name }
 func (c *tunnelConn) RemoteAddr() net.Addr             { return c.name }
-func (c *tunnelConn) SetDeadline(time.Time) error      { return nil }
-func (c *tunnelConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *tunnelConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *tunnelConn) SetDeadline(time.Time) error      { return errTunnelDeadline }
+func (c *tunnelConn) SetReadDeadline(time.Time) error  { return errTunnelDeadline }
+func (c *tunnelConn) SetWriteDeadline(time.Time) error { return errTunnelDeadline }
 
 type tunnelAddr string
 
@@ -980,6 +1095,10 @@ func (c *proxyController) OpenTunnel(authority string) (net.Conn, error) {
 					Conn:    conn,
 					release: release,
 				}, nil
+			}
+			if !shouldRebuildProxySession(err) {
+				release()
+				return nil, err
 			}
 			lastErr = err
 			failedSession = ms

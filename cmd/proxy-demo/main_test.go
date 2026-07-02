@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -357,6 +359,75 @@ func TestTunnelConnCloseWriteClosesRequestBody(t *testing.T) {
 	}
 }
 
+func TestTunnelConnCloseCancelsRequestContext(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	conn := &tunnelConn{
+		reader: io.NopCloser(strings.NewReader("")),
+		writer: func() *io.PipeWriter {
+			_, writer := io.Pipe()
+			return writer
+		}(),
+		cancel: cancel,
+		name:   "test-tunnel",
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("expected Close to cancel request context")
+	}
+}
+
+func TestTunnelConnDeadlineUnsupported(t *testing.T) {
+	t.Parallel()
+
+	conn := &tunnelConn{}
+	if !errors.Is(conn.SetDeadline(time.Now()), errTunnelDeadline) {
+		t.Fatal("expected SetDeadline to report unsupported tunnel deadline")
+	}
+	if !errors.Is(conn.SetReadDeadline(time.Now()), errTunnelDeadline) {
+		t.Fatal("expected SetReadDeadline to report unsupported tunnel deadline")
+	}
+	if !errors.Is(conn.SetWriteDeadline(time.Now()), errTunnelDeadline) {
+		t.Fatal("expected SetWriteDeadline to report unsupported tunnel deadline")
+	}
+}
+
+func TestRoundTripWithOpenTimeout(t *testing.T) {
+	t.Parallel()
+
+	_, _, err := roundTripWithOpenTimeout(20*time.Millisecond, func(ctx context.Context) (*http.Response, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	var timeoutErr *tunnelOpenTimeoutError
+	if !errors.As(err, &timeoutErr) {
+		t.Fatalf("expected tunnelOpenTimeoutError, got %v", err)
+	}
+}
+
+func TestShouldRebuildProxySession(t *testing.T) {
+	t.Parallel()
+
+	if shouldRebuildProxySession(&proxyConnectHTTPError{statusCode: http.StatusBadGateway, status: "502 Bad Gateway"}) {
+		t.Fatal("expected target/proxy CONNECT 502 to avoid session rebuild")
+	}
+	if !shouldRebuildProxySession(&proxyConnectHTTPError{statusCode: http.StatusProxyAuthRequired, status: "407 Proxy Authentication Required"}) {
+		t.Fatal("expected proxy auth failure to rebuild session")
+	}
+	if shouldRebuildProxySession(&tunnelOpenTimeoutError{timeout: time.Second}) {
+		t.Fatal("expected CONNECT timeout to avoid session rebuild")
+	}
+	if !shouldRebuildProxySession(errors.New("transport closed")) {
+		t.Fatal("expected transport errors to rebuild session")
+	}
+}
+
 func TestProxyControllerSwapDrainsOldSession(t *testing.T) {
 	t.Parallel()
 
@@ -469,6 +540,48 @@ func TestProxyControllerRebuildsSessionAfterOpenTunnelFailure(t *testing.T) {
 	}
 	if newSession.openCount.Load() != 1 {
 		t.Fatalf("expected new session open count 1, got %d", newSession.openCount.Load())
+	}
+}
+
+func TestProxyControllerDoesNotRebuildForConnectHTTPFailure(t *testing.T) {
+	t.Parallel()
+
+	session := &fakeProxySession{
+		openErr: &proxyConnectHTTPError{
+			statusCode: http.StatusBadGateway,
+			status:     "502 Bad Gateway",
+			body:       "target unreachable",
+		},
+	}
+	controller := &proxyController{
+		current: &managedSession{
+			session:   session,
+			expiresAt: time.Now().Add(10 * time.Minute),
+			accepting: true,
+		},
+	}
+	var rebuilds atomic.Int32
+	controller.refreshSession = func() error {
+		rebuilds.Add(1)
+		return nil
+	}
+
+	_, err := controller.OpenTunnel("example.com:443")
+	if err == nil {
+		t.Fatal("expected OpenTunnel to fail")
+	}
+	var connectErr *proxyConnectHTTPError
+	if !errors.As(err, &connectErr) {
+		t.Fatalf("expected proxyConnectHTTPError, got %v", err)
+	}
+	if rebuilds.Load() != 0 {
+		t.Fatalf("expected no rebuilds, got %d", rebuilds.Load())
+	}
+	if session.closeCount.Load() != 0 {
+		t.Fatalf("expected current session to remain open, got close count %d", session.closeCount.Load())
+	}
+	if !controller.current.accepting {
+		t.Fatal("expected current session to remain accepting")
 	}
 }
 
