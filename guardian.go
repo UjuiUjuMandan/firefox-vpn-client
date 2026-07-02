@@ -12,6 +12,11 @@ import (
 
 const GuardianEndpointDefault = "https://vpn.mozilla.org"
 
+const (
+	proxyPassClaimTimeTolerance = time.Minute
+	proxyPassClaimTimeMaxFuture = 2 * time.Hour
+)
+
 type ProxyPassClaims struct {
 	Sub string `json:"sub"`
 	Aud string `json:"aud"`
@@ -125,14 +130,20 @@ func fetchProxyPass(endpoint, accessToken string) (*ProxyPassInfo, error) {
 }
 
 func detectProxyPassClaimTimeOffset(claims ProxyPassClaims, now time.Time) time.Duration {
-	if claims.Nbf == 0 || claims.Exp == 0 || claims.Exp <= claims.Nbf {
+	if claims.Exp == 0 {
 		return 0
 	}
 
-	rawNbf := time.Unix(claims.Nbf, 0)
 	rawExp := time.Unix(claims.Exp, 0)
-	tolerance := time.Minute
-	if withinTimeWindow(now, rawNbf.Add(-tolerance), rawExp.Add(tolerance)) {
+	rawStart, hasStart := proxyPassClaimStartTime(claims)
+	if hasStart {
+		if !rawStart.Before(rawExp) {
+			return 0
+		}
+		if withinTimeWindow(now, rawStart.Add(-proxyPassClaimTimeTolerance), rawExp.Add(proxyPassClaimTimeTolerance)) {
+			return 0
+		}
+	} else if proxyPassExpirationLooksFresh(now, rawExp) {
 		return 0
 	}
 
@@ -141,12 +152,34 @@ func detectProxyPassClaimTimeOffset(claims ProxyPassClaims, now time.Time) time.
 		return 0
 	}
 	offset := time.Duration(offsetSeconds) * time.Second
-	shiftedNbf := rawNbf.Add(offset)
 	shiftedExp := rawExp.Add(offset)
-	if withinTimeWindow(now, shiftedNbf.Add(-tolerance), shiftedExp.Add(tolerance)) {
+	if hasStart {
+		shiftedStart := rawStart.Add(offset)
+		if withinTimeWindow(now, shiftedStart.Add(-proxyPassClaimTimeTolerance), shiftedExp.Add(proxyPassClaimTimeTolerance)) {
+			return offset
+		}
+	} else if proxyPassExpirationLooksFresh(now, shiftedExp) {
 		return offset
 	}
 	return 0
+}
+
+func proxyPassClaimStartTime(claims ProxyPassClaims) (time.Time, bool) {
+	switch {
+	case claims.Nbf > 0:
+		return time.Unix(claims.Nbf, 0), true
+	case claims.Iat > 0:
+		return time.Unix(claims.Iat, 0), true
+	default:
+		return time.Time{}, false
+	}
+}
+
+func proxyPassExpirationLooksFresh(now, exp time.Time) bool {
+	if exp.Before(now.Add(-proxyPassClaimTimeTolerance)) {
+		return false
+	}
+	return exp.Sub(now) <= proxyPassClaimTimeMaxFuture
 }
 
 func withinTimeWindow(t, start, end time.Time) bool {
