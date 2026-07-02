@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -257,10 +258,14 @@ func TestSocksServerAllowsConcurrentClients(t *testing.T) {
 type fakeProxySession struct {
 	openCount  atomic.Int32
 	closeCount atomic.Int32
+	openErr    error
 }
 
 func (s *fakeProxySession) OpenTunnel(authority string) (net.Conn, error) {
 	s.openCount.Add(1)
+	if s.openErr != nil {
+		return nil, s.openErr
+	}
 	return &fakeNetConn{}, nil
 }
 
@@ -336,6 +341,9 @@ func TestProxyControllerDisableExpiredSessionRejectsNewTunnels(t *testing.T) {
 			accepting: true,
 		},
 	}
+	controller.refreshSession = func() error {
+		return errNoUsableProxySession
+	}
 
 	conn, err := controller.OpenTunnel("example.com:443")
 	if err != nil {
@@ -355,5 +363,96 @@ func TestProxyControllerDisableExpiredSessionRejectsNewTunnels(t *testing.T) {
 	_ = conn.Close()
 	if session.closeCount.Load() != 1 {
 		t.Fatalf("expected session close after active tunnel drained, got %d", session.closeCount.Load())
+	}
+}
+
+func TestProxyControllerRebuildsSessionAfterOpenTunnelFailure(t *testing.T) {
+	t.Parallel()
+
+	failedSession := &fakeProxySession{openErr: errors.New("upstream session is gone")}
+	newSession := &fakeProxySession{}
+	controller := &proxyController{
+		current: &managedSession{
+			session:   failedSession,
+			expiresAt: time.Now().Add(10 * time.Minute),
+			accepting: true,
+		},
+	}
+	controller.refreshSession = func() error {
+		controller.swapSession(newSession, time.Now().Add(20*time.Minute))
+		return nil
+	}
+
+	conn, err := controller.OpenTunnel("example.com:443")
+	if err != nil {
+		t.Fatalf("OpenTunnel after rebuild failed: %v", err)
+	}
+	_ = conn.Close()
+
+	if failedSession.openCount.Load() != 1 {
+		t.Fatalf("expected failed session open count 1, got %d", failedSession.openCount.Load())
+	}
+	if failedSession.closeCount.Load() != 1 {
+		t.Fatalf("expected failed session to close after rebuild, got %d", failedSession.closeCount.Load())
+	}
+	if newSession.openCount.Load() != 1 {
+		t.Fatalf("expected new session open count 1, got %d", newSession.openCount.Load())
+	}
+}
+
+func TestProxyControllerStopsAfterThreeOpenTunnelRebuilds(t *testing.T) {
+	t.Parallel()
+
+	controller := &proxyController{
+		current: &managedSession{
+			session:   &fakeProxySession{openErr: errors.New("initial session failed")},
+			expiresAt: time.Now().Add(10 * time.Minute),
+			accepting: true,
+		},
+	}
+	var rebuilds atomic.Int32
+	controller.refreshSession = func() error {
+		n := rebuilds.Add(1)
+		controller.swapSession(
+			&fakeProxySession{openErr: fmt.Errorf("rebuilt session %d failed", n)},
+			time.Now().Add(20*time.Minute),
+		)
+		return nil
+	}
+
+	_, err := controller.OpenTunnel("example.com:443")
+	if err == nil {
+		t.Fatal("expected OpenTunnel to fail")
+	}
+	if rebuilds.Load() != maxOpenTunnelRebuildRetries {
+		t.Fatalf("expected %d rebuilds, got %d", maxOpenTunnelRebuildRetries, rebuilds.Load())
+	}
+}
+
+func TestProxyControllerKeepsRebuildErrorWhenSessionUnavailable(t *testing.T) {
+	t.Parallel()
+
+	controller := &proxyController{
+		current: &managedSession{
+			session:   &fakeProxySession{openErr: errors.New("initial session failed")},
+			expiresAt: time.Now().Add(10 * time.Minute),
+			accepting: true,
+		},
+	}
+	var rebuilds atomic.Int32
+	controller.refreshSession = func() error {
+		rebuilds.Add(1)
+		return errors.New("refresh token rejected")
+	}
+
+	_, err := controller.OpenTunnel("example.com:443")
+	if err == nil {
+		t.Fatal("expected OpenTunnel to fail")
+	}
+	if !strings.Contains(err.Error(), "refresh token rejected") {
+		t.Fatalf("expected rebuild error to be preserved, got %v", err)
+	}
+	if rebuilds.Load() != maxOpenTunnelRebuildRetries {
+		t.Fatalf("expected %d rebuilds, got %d", maxOpenTunnelRebuildRetries, rebuilds.Load())
 	}
 }

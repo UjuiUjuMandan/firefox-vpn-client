@@ -45,9 +45,10 @@ const (
 )
 
 const (
-	proxyPassRenewLead  = 2 * time.Minute
-	proxyPassRetryDelay = 30 * time.Second
-	oauthRefreshLead    = 2 * time.Minute
+	proxyPassRenewLead          = 2 * time.Minute
+	proxyPassRetryDelay         = 30 * time.Second
+	oauthRefreshLead            = 2 * time.Minute
+	maxOpenTunnelRebuildRetries = 3
 )
 
 var (
@@ -851,7 +852,9 @@ type proxyController struct {
 	timeout  time.Duration
 
 	sessionFactory func(token string) (proxySession, error)
+	refreshSession func() error
 
+	renewMu sync.Mutex
 	mu      sync.Mutex
 	auth    *runtimeAuth
 	current *managedSession
@@ -890,20 +893,45 @@ func newProxyController(cfg proxyControllerConfig) (*proxyController, error) {
 }
 
 func (c *proxyController) OpenTunnel(authority string) (net.Conn, error) {
-	ms, release, err := c.acquireSession()
-	if err != nil {
-		return nil, err
-	}
+	var lastErr error
+	for attempt := 0; attempt <= maxOpenTunnelRebuildRetries; attempt++ {
+		ms, release, err := c.acquireSession()
+		if err != nil {
+			if c.isClosed() {
+				return nil, err
+			}
+			if !errors.Is(err, errNoUsableProxySession) || lastErr == nil {
+				lastErr = err
+			}
+		} else {
+			conn, err := ms.session.OpenTunnel(authority)
+			if err == nil {
+				return &managedTunnelConn{
+					Conn:    conn,
+					release: release,
+				}, nil
+			}
+			lastErr = err
+			c.markSessionUnusable(ms)
+			release()
+		}
 
-	conn, err := ms.session.OpenTunnel(authority)
-	if err != nil {
-		release()
-		return nil, err
+		if attempt == maxOpenTunnelRebuildRetries {
+			break
+		}
+
+		fmt.Fprintf(os.Stderr, "Upstream tunnel open failed: %v; rebuilding proxy session...\n", lastErr)
+		if err := c.rebuildSession(); err != nil {
+			lastErr = fmt.Errorf("rebuilding upstream proxy session: %w", err)
+		}
 	}
-	return &managedTunnelConn{
-		Conn:    conn,
-		release: release,
-	}, nil
+	return nil, lastErr
+}
+
+func (c *proxyController) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 func (c *proxyController) acquireSession() (*managedSession, func(), error) {
@@ -931,6 +959,16 @@ func (c *proxyController) releaseSession(ms *managedSession) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ms.refs--
+	c.maybeCloseLocked(ms)
+}
+
+func (c *proxyController) markSessionUnusable(ms *managedSession) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ms == nil || c.current != ms {
+		return
+	}
+	ms.accepting = false
 	c.maybeCloseLocked(ms)
 }
 
@@ -1013,6 +1051,19 @@ func (c *proxyController) nextRenewalDelay() time.Duration {
 }
 
 func (c *proxyController) renew() error {
+	c.renewMu.Lock()
+	defer c.renewMu.Unlock()
+	return c.renewLocked()
+}
+
+func (c *proxyController) rebuildSession() error {
+	if c.refreshSession != nil {
+		return c.refreshSession()
+	}
+	return c.renew()
+}
+
+func (c *proxyController) renewLocked() error {
 	auth, err := c.ensureOAuthToken()
 	if err != nil {
 		return err
