@@ -22,15 +22,24 @@ type ProxyPassClaims struct {
 }
 
 type ProxyPassInfo struct {
-	RawToken   string
-	Claims     ProxyPassClaims
-	QuotaMax   string
-	QuotaLeft  string
-	QuotaReset string
+	RawToken        string
+	Claims          ProxyPassClaims
+	QuotaMax        string
+	QuotaLeft       string
+	QuotaReset      string
+	claimTimeOffset time.Duration
 }
 
-func (p *ProxyPassInfo) NotBefore() time.Time { return time.Unix(p.Claims.Nbf, 0) }
-func (p *ProxyPassInfo) ExpiresAt() time.Time { return time.Unix(p.Claims.Exp, 0) }
+func (p *ProxyPassInfo) NotBefore() time.Time { return p.claimTime(p.Claims.Nbf) }
+func (p *ProxyPassInfo) ExpiresAt() time.Time { return p.claimTime(p.Claims.Exp) }
+
+func (p *ProxyPassInfo) claimTime(sec int64) time.Time {
+	return time.Unix(sec, 0).Add(p.claimTimeOffset)
+}
+
+func (p *ProxyPassInfo) ClaimTimeCorrection() time.Duration {
+	return p.claimTimeOffset
+}
 
 func (p *ProxyPassInfo) BearerToken() string { return "Bearer " + p.RawToken }
 
@@ -105,13 +114,43 @@ func fetchProxyPass(endpoint, accessToken string) (*ProxyPassInfo, error) {
 	}
 
 	info := &ProxyPassInfo{
-		RawToken:   passResp.Token,
-		Claims:     *claims,
-		QuotaMax:   resp.Header.Get("X-Quota-Limit"),
-		QuotaLeft:  resp.Header.Get("X-Quota-Remaining"),
-		QuotaReset: resp.Header.Get("X-Quota-Reset"),
+		RawToken:        passResp.Token,
+		Claims:          *claims,
+		QuotaMax:        resp.Header.Get("X-Quota-Limit"),
+		QuotaLeft:       resp.Header.Get("X-Quota-Remaining"),
+		QuotaReset:      resp.Header.Get("X-Quota-Reset"),
+		claimTimeOffset: detectProxyPassClaimTimeOffset(*claims, time.Now()),
 	}
 	return info, nil
+}
+
+func detectProxyPassClaimTimeOffset(claims ProxyPassClaims, now time.Time) time.Duration {
+	if claims.Nbf == 0 || claims.Exp == 0 || claims.Exp <= claims.Nbf {
+		return 0
+	}
+
+	rawNbf := time.Unix(claims.Nbf, 0)
+	rawExp := time.Unix(claims.Exp, 0)
+	tolerance := time.Minute
+	if withinTimeWindow(now, rawNbf.Add(-tolerance), rawExp.Add(tolerance)) {
+		return 0
+	}
+
+	_, offsetSeconds := now.Zone()
+	if offsetSeconds == 0 {
+		return 0
+	}
+	offset := time.Duration(offsetSeconds) * time.Second
+	shiftedNbf := rawNbf.Add(offset)
+	shiftedExp := rawExp.Add(offset)
+	if withinTimeWindow(now, shiftedNbf.Add(-tolerance), shiftedExp.Add(tolerance)) {
+		return offset
+	}
+	return 0
+}
+
+func withinTimeWindow(t, start, end time.Time) bool {
+	return !t.Before(start) && !t.After(end)
 }
 
 func fetchUserInfo(endpoint, accessToken string) (*Entitlement, error) {

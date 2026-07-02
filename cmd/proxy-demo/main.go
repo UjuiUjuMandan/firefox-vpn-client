@@ -181,6 +181,7 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	logProxyPassTimeCorrection(pass)
 	if *printInfoFlag {
 		printRuntimeInfo(*guardianFlag, runtimeAuth.Token.AccessToken, pass, countries)
 		return
@@ -325,6 +326,13 @@ func printRuntimeInfo(guardian, accessToken string, pass *vpnclient.ProxyPassInf
 		return
 	}
 	vpnclient.PrintServerList(countries)
+}
+
+func logProxyPassTimeCorrection(pass *vpnclient.ProxyPassInfo) {
+	if pass == nil || pass.ClaimTimeCorrection() == 0 {
+		return
+	}
+	logWarn("proxy pass JWT claim time correction applied offset=%s expires_at=%s", pass.ClaimTimeCorrection(), pass.ExpiresAt().Format(time.RFC3339))
 }
 
 func obtainOAuthToken(forceLogin bool) (*vpnclient.TokenResponse, string) {
@@ -1482,6 +1490,7 @@ func (c *proxyController) renewLocked() error {
 			return err
 		}
 	}
+	logProxyPassTimeCorrection(pass)
 
 	session, err := c.sessionFactory(pass.RawToken)
 	if err != nil {
