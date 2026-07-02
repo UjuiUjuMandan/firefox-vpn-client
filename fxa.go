@@ -136,7 +136,14 @@ func fxaLogin(email, password string) (*LoginResponse, error) {
 	bodyJSON, _ := json.Marshal(body)
 
 	loginURL := fxaAuthServer + "/account/login"
-	resp, err := http.Post(loginURL, "application/json", strings.NewReader(string(bodyJSON)))
+	req, err := http.NewRequest("POST", loginURL, strings.NewReader(string(bodyJSON)))
+	if err != nil {
+		return nil, fmt.Errorf("creating login request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	applyMozillaVPNHeaders(req)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("login request: %w", err)
 	}
@@ -174,9 +181,13 @@ func fxaOAuthToken(sessionToken string) (*TokenResponse, error) {
 		return nil, fmt.Errorf("generating hawk header: %w", err)
 	}
 
-	req, _ := http.NewRequest("POST", tokenURL, strings.NewReader(string(bodyJSON)))
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(string(bodyJSON)))
+	if err != nil {
+		return nil, fmt.Errorf("creating oauth token request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", authHeader)
+	applyMozillaVPNHeaders(req)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -206,7 +217,14 @@ func fxaRefreshToken(refreshToken string) (*TokenResponse, error) {
 	bodyJSON, _ := json.Marshal(body)
 
 	tokenURL := fxaAuthServer + "/oauth/token"
-	resp, err := http.Post(tokenURL, "application/json", strings.NewReader(string(bodyJSON)))
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(string(bodyJSON)))
+	if err != nil {
+		return nil, fmt.Errorf("creating refresh request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	applyMozillaVPNHeaders(req)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("refresh request: %w", err)
 	}

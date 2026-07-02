@@ -56,6 +56,7 @@ func fetchProxyPass(endpoint, accessToken string) (*ProxyPassInfo, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
+	applyMozillaVPNHeaders(req)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -110,6 +111,7 @@ func fetchUserInfo(endpoint, accessToken string) (*Entitlement, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
+	applyMozillaVPNHeaders(req)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
