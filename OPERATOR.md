@@ -43,6 +43,28 @@ INFO  exit selected country="Japan" country_code=JP city="Tokyo" city_code=tyo p
 
 `local_to_exit_latency` 是建立上游 HTTP/2/TLS 或 HTTP/3/QUIC session 的耗时，不是 ICMP ping。
 
+## 出口延迟与 Fastly 内部路径
+
+如果 VPS 到 Fastly 入口很近，但 `local_to_exit_latency` 或经代理访问目标的延迟明显偏高，问题可能在 Fastly 内部路径，而不在 VPS 机房出口。
+
+典型现象：
+
+```text
+VPS -> 本地交换中心/Fastly 入口: <1ms
+Fastly 内部静默跳点
+到 MASQUE/CONNECT 终端: 100ms+
+```
+
+这表示流量很快进入了 Fastly 网络，但 Fastly 可能把 Firefox VPN 的 CONNECT/MASQUE 流量转发到某个远端 gateway 再出网。这个 gateway 不一定和 VPS 所在城市相同，也不一定是最近的普通 CDN 边缘节点。
+
+排查建议：
+
+- 不要只看 `mtr` 中间跳；Fastly 内部跳点可能静默，ICMP 也不等同于 CONNECT/MASQUE 实际路径。
+- 以程序日志里的 `local_to_exit_latency`、经 SOCKS 访问目标站的 RTT、下载速度作为主要判断依据。
+- `PROXY=` 为空时会随机选择 CONNECT server，可能选到跨洲或内部绕路严重的节点。
+- 需要稳定出口时，优先固定一个实测延迟低的 `PROXY=HOST:PORT`。
+- 如果同一国家的多个节点全部高延迟，通常是 Fastly 对当前 VPS 线路的内部调度问题，客户端侧很难强制它落到本地 gateway。
+
 ## systemd 部署
 
 脚本位置：
@@ -172,6 +194,15 @@ sudo ./scripts/install-systemd.sh login
 出口国家显示 `unknown`
 
 通常是手动 `-proxy` 指定了不在 server list 里的 host，或者拉取 server list 失败。代理仍可运行，只是无法标注国家/城市。
+
+出口延迟异常高
+
+如果 `mtr` 显示 VPS 到本地 Fastly 入口很低，但最终到 `*.m1.fastly-masque.net` 或出口路径突然增加 100ms 以上，通常是 Fastly 内部把 CONNECT/MASQUE 流量转到了远端 gateway。优先处理：
+
+- 用 `-print-info` 查看可用节点。
+- 手动指定多个同区域节点测试。
+- 把最低延迟的节点写入 `/etc/default/firefox-vpn-client` 的 `PROXY=`。
+- 重启服务后确认日志里的 `exit selected ... proxy=... local_to_exit_latency=...`。
 
 服务启动后立即重启
 
