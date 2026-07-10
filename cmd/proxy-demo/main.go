@@ -1006,7 +1006,11 @@ func newH3ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (
 	}
 	proxyHost := net.JoinHostPort(host, portStr)
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx := context.Background()
+	cancel := func() {}
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
+	}
 	defer cancel()
 
 	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
@@ -1026,9 +1030,12 @@ func newH3ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (
 		KeepAlivePeriod: 30 * time.Second,
 	}
 
-	perAttempt := timeout / time.Duration(len(ips))
-	if perAttempt < 3*time.Second {
-		perAttempt = 3 * time.Second
+	var perAttempt time.Duration
+	if timeout > 0 {
+		perAttempt = timeout / time.Duration(len(ips))
+		if perAttempt < 3*time.Second {
+			perAttempt = 3 * time.Second
+		}
 	}
 
 	var (
@@ -1043,7 +1050,11 @@ func newH3ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (
 			continue
 		}
 		udpAddr := &net.UDPAddr{IP: ip.AsSlice(), Port: port, Zone: ip.Zone()}
-		attemptCtx, attemptCancel := context.WithTimeout(ctx, perAttempt)
+		attemptCtx := ctx
+		attemptCancel := func() {}
+		if perAttempt > 0 {
+			attemptCtx, attemptCancel = context.WithTimeout(ctx, perAttempt)
+		}
 		c, err := quic.Dial(attemptCtx, uc, udpAddr, tlsCfg, quicCfg)
 		attemptCancel()
 		if err != nil {
@@ -1237,6 +1248,10 @@ type proxyController struct {
 	auth    *runtimeAuth
 	current *managedSession
 	closed  bool
+	done    chan struct{}
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func newProxyController(cfg proxyControllerConfig) (*proxyController, error) {
@@ -1262,6 +1277,7 @@ func newProxyController(cfg proxyControllerConfig) (*proxyController, error) {
 		timeout:        cfg.Timeout,
 		sessionFactory: factory,
 		auth:           cfg.Auth,
+		done:           make(chan struct{}),
 		current: &managedSession{
 			session:   session,
 			expiresAt: cfg.Pass.ExpiresAt(),
@@ -1414,24 +1430,43 @@ func (c *proxyController) hasUsableSessionOtherThan(failedSession *managedSessio
 
 func (c *proxyController) runRenewalLoop() {
 	for {
-		c.mu.Lock()
-		closed := c.closed
-		c.mu.Unlock()
-		if closed {
+		if c.isClosed() {
 			return
 		}
 		sleep := c.nextRenewalDelay()
-		if sleep > 0 {
-			time.Sleep(sleep)
+		if !c.sleepOrDone(sleep) {
+			return
 		}
 		if err := c.renew(); err != nil {
 			now := time.Now()
 			logWarn("proxy pass renewal failed: %s", logErr(err))
 			c.disableExpiredSession(now)
 			logDebug("proxy pass renewal retry scheduled delay=%s", proxyPassRetryDelay)
-			time.Sleep(proxyPassRetryDelay)
+			if !c.sleepOrDone(proxyPassRetryDelay) {
+				return
+			}
 			continue
 		}
+	}
+}
+
+func (c *proxyController) sleepOrDone(d time.Duration) bool {
+	if d <= 0 {
+		select {
+		case <-c.done:
+			return false
+		default:
+			return true
+		}
+	}
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-c.done:
+		return false
 	}
 }
 
@@ -1537,16 +1572,21 @@ func (c *proxyController) ensureOAuthToken() (*runtimeAuth, error) {
 }
 
 func (c *proxyController) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.closeOnce.Do(func() {
+		if c.done != nil {
+			close(c.done)
+		}
 
-	c.closed = true
-	var err error
-	if c.current != nil && c.current.session != nil {
-		err = c.current.session.Close()
-		c.current.session = nil
-	}
-	return err
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		c.closed = true
+		if c.current != nil && c.current.session != nil {
+			c.closeErr = c.current.session.Close()
+			c.current.session = nil
+		}
+	})
+	return c.closeErr
 }
 
 type managedTunnelConn struct {

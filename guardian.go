@@ -83,26 +83,26 @@ func fetchProxyPass(endpoint, accessToken string) (*ProxyPassInfo, error) {
 	req.Header.Set("Content-Type", "application/json")
 	applyMozillaVPNHeaders(req)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := doControlPlane(req)
 	if err != nil {
 		return nil, fmt.Errorf("guardian request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading guardian response: %w", err)
-	}
-
 	if resp.StatusCode == 429 {
-		return nil, fmt.Errorf("quota exceeded (HTTP 429): %s", string(body))
+		return nil, fmt.Errorf("quota exceeded (HTTP 429): %s", readErrorBody(resp.Body))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, &GuardianHTTPError{
 			Operation:  "guardian",
 			StatusCode: resp.StatusCode,
-			Body:       string(body),
+			Body:       readErrorBody(resp.Body),
 		}
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading guardian response: %w", err)
 	}
 
 	var passResp proxyPassResponse
@@ -147,21 +147,38 @@ func detectProxyPassClaimTimeOffset(claims ProxyPassClaims, now time.Time) time.
 		return 0
 	}
 
-	_, offsetSeconds := now.Zone()
-	if offsetSeconds == 0 {
-		return 0
-	}
-	offset := time.Duration(offsetSeconds) * time.Second
-	shiftedExp := rawExp.Add(offset)
-	if hasStart {
-		shiftedStart := rawStart.Add(offset)
-		if withinTimeWindow(now, shiftedStart.Add(-proxyPassClaimTimeTolerance), shiftedExp.Add(proxyPassClaimTimeTolerance)) {
+	for _, offset := range proxyPassClaimTimeOffsetCandidates(now) {
+		shiftedExp := rawExp.Add(offset)
+		if hasStart {
+			shiftedStart := rawStart.Add(offset)
+			if withinTimeWindow(now, shiftedStart.Add(-proxyPassClaimTimeTolerance), shiftedExp.Add(proxyPassClaimTimeTolerance)) {
+				return offset
+			}
+		} else if proxyPassExpirationLooksFresh(now, shiftedExp) {
 			return offset
 		}
-	} else if proxyPassExpirationLooksFresh(now, shiftedExp) {
-		return offset
 	}
 	return 0
+}
+
+func proxyPassClaimTimeOffsetCandidates(now time.Time) []time.Duration {
+	seen := make(map[time.Duration]bool)
+	candidates := make([]time.Duration, 0, 107)
+	add := func(offset time.Duration) {
+		if offset == 0 || seen[offset] {
+			return
+		}
+		seen[offset] = true
+		candidates = append(candidates, offset)
+	}
+
+	_, offsetSeconds := now.Zone()
+	add(time.Duration(offsetSeconds) * time.Second)
+
+	for minutes := -12 * 60; minutes <= 14*60; minutes += 15 {
+		add(time.Duration(minutes) * time.Minute)
+	}
+	return candidates
 }
 
 func proxyPassClaimStartTime(claims ProxyPassClaims) (time.Time, bool) {
@@ -200,23 +217,23 @@ func fetchUserInfo(endpoint, accessToken string) (*Entitlement, error) {
 	req.Header.Set("Content-Type", "application/json")
 	applyMozillaVPNHeaders(req)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := doControlPlane(req)
 	if err != nil {
 		return nil, fmt.Errorf("guardian user info request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
 	if resp.StatusCode != http.StatusOK {
 		return nil, &GuardianHTTPError{
 			Operation:  "guardian user info",
 			StatusCode: resp.StatusCode,
-			Body:       string(body),
+			Body:       readErrorBody(resp.Body),
 		}
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
 
 	var ent Entitlement
@@ -240,23 +257,23 @@ func activateGuardian(endpoint, accessToken string) (*Entitlement, error) {
 	req.Header.Set("Content-Type", "application/json")
 	applyMozillaVPNHeaders(req)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := doControlPlane(req)
 	if err != nil {
 		return nil, fmt.Errorf("guardian activate request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
 	if resp.StatusCode != http.StatusOK {
 		return nil, &GuardianHTTPError{
 			Operation:  "guardian activate",
 			StatusCode: resp.StatusCode,
-			Body:       string(body),
+			Body:       readErrorBody(resp.Body),
 		}
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
 
 	var ent Entitlement

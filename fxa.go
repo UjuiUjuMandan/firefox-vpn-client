@@ -77,7 +77,9 @@ func hawkHeader(method, rawURL, hawkID string, hawkKey []byte, payload string) (
 	}
 
 	nonce := make([]byte, 6)
-	rand.Read(nonce)
+	if _, err := rand.Read(nonce); err != nil {
+		return "", fmt.Errorf("generating nonce: %w", err)
+	}
 	nonceStr := hex.EncodeToString(nonce)
 	ts := fmt.Sprintf("%d", time.Now().Unix())
 
@@ -143,15 +145,18 @@ func fxaLogin(email, password string) (*LoginResponse, error) {
 	req.Header.Set("Content-Type", "application/json")
 	applyMozillaVPNHeaders(req)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := doControlPlane(req)
 	if err != nil {
 		return nil, fmt.Errorf("login request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("login failed (HTTP %d): %s", resp.StatusCode, string(data))
+		return nil, fmt.Errorf("login failed (HTTP %d): %s", resp.StatusCode, readErrorBody(resp.Body))
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading login response: %w", err)
 	}
 
 	var loginResp LoginResponse
@@ -189,15 +194,18 @@ func fxaOAuthToken(sessionToken string) (*TokenResponse, error) {
 	req.Header.Set("Authorization", authHeader)
 	applyMozillaVPNHeaders(req)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := doControlPlane(req)
 	if err != nil {
 		return nil, fmt.Errorf("oauth token request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("oauth token failed (HTTP %d): %s", resp.StatusCode, string(data))
+		return nil, fmt.Errorf("oauth token failed (HTTP %d): %s", resp.StatusCode, readErrorBody(resp.Body))
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading token response: %w", err)
 	}
 
 	var tok TokenResponse
@@ -224,15 +232,18 @@ func fxaRefreshToken(refreshToken string) (*TokenResponse, error) {
 	req.Header.Set("Content-Type", "application/json")
 	applyMozillaVPNHeaders(req)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := doControlPlane(req)
 	if err != nil {
 		return nil, fmt.Errorf("refresh request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("refresh failed (HTTP %d): %s", resp.StatusCode, string(data))
+		return nil, fmt.Errorf("refresh failed (HTTP %d): %s", resp.StatusCode, readErrorBody(resp.Body))
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading refresh response: %w", err)
 	}
 
 	var tok TokenResponse

@@ -12,6 +12,29 @@ UNIT_FILE="${UNIT_FILE:-/etc/systemd/system/$SERVICE_NAME.service}"
 HEALTH_UNIT_FILE="${HEALTH_UNIT_FILE:-/etc/systemd/system/$SERVICE_NAME-health.service}"
 HEALTH_TIMER_FILE="${HEALTH_TIMER_FILE:-/etc/systemd/system/$SERVICE_NAME-health.timer}"
 
+CONFIG_KEYS=(
+  LISTEN
+  PROXY
+  GUARDIAN
+  TIMEOUT
+  HANDSHAKE_TIMEOUT
+  MAX_CONNS
+  USE_H3
+  VERBOSE
+  EXTRA_ARGS
+  HEALTH_INTERVAL
+  HEALTH_TIMEOUT
+  HEALTH_VERBOSE
+  HEALTH_TARGET
+)
+
+declare -A EXPLICIT_CONFIG
+for key in "${CONFIG_KEYS[@]}"; do
+  if [[ -v "$key" ]]; then
+    EXPLICIT_CONFIG["$key"]="${!key}"
+  fi
+done
+
 LISTEN="${LISTEN:-127.0.0.1:1080}"
 PROXY="${PROXY:-}"
 GUARDIAN="${GUARDIAN:-}"
@@ -24,6 +47,7 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 HEALTH_INTERVAL="${HEALTH_INTERVAL:-30s}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-5}"
 HEALTH_VERBOSE="${HEALTH_VERBOSE:-0}"
+HEALTH_TARGET="${HEALTH_TARGET:-example.com:443}"
 PURGE="${PURGE:-0}"
 SKIP_START="${SKIP_START:-0}"
 
@@ -64,6 +88,7 @@ Common environment overrides:
   HEALTH_INTERVAL=$HEALTH_INTERVAL
   HEALTH_TIMEOUT=$HEALTH_TIMEOUT
   HEALTH_VERBOSE=$HEALTH_VERBOSE
+  HEALTH_TARGET=$HEALTH_TARGET
   EXTRA_ARGS="$EXTRA_ARGS"
 
 Examples:
@@ -99,6 +124,20 @@ write_env_var() {
   printf '%s=' "$key"
   single_quote "$value"
   printf '\n'
+}
+
+load_existing_env_file() {
+  if [[ -r "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+  fi
+
+  local key
+  for key in "${!EXPLICIT_CONFIG[@]}"; do
+    printf -v "$key" '%s' "${EXPLICIT_CONFIG[$key]}"
+  done
 }
 
 service_shell() {
@@ -160,8 +199,10 @@ write_env_file() {
     write_env_var USE_H3 "$USE_H3"
     write_env_var VERBOSE "$VERBOSE"
     write_env_var EXTRA_ARGS "$EXTRA_ARGS"
+    write_env_var HEALTH_INTERVAL "$HEALTH_INTERVAL"
     write_env_var HEALTH_TIMEOUT "$HEALTH_TIMEOUT"
     write_env_var HEALTH_VERBOSE "$HEALTH_VERBOSE"
+    write_env_var HEALTH_TARGET "$HEALTH_TARGET"
   } > "$ENV_FILE"
   chmod 0644 "$ENV_FILE"
 }
@@ -270,29 +311,95 @@ parse_listen() {
 }
 
 check_socks_with_python() {
-  python3 - "$HEALTH_HOST" "$HEALTH_PORT" "$HEALTH_TIMEOUT" <<'PY'
+  python3 - "$HEALTH_HOST" "$HEALTH_PORT" "$HEALTH_TIMEOUT" "$HEALTH_TARGET" <<'PY'
+import ipaddress
 import socket
 import sys
 
-host, port, timeout = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
-with socket.create_connection((host, port), timeout=timeout) as sock:
+proxy_host, proxy_port, timeout, target = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+
+def split_host_port(value):
+    if value.startswith("["):
+        end = value.find("]")
+        if end == -1 or len(value) <= end + 2 or value[end + 1] != ":":
+            raise SystemExit(f"invalid target: {value!r}")
+        return value[1:end], int(value[end + 2:])
+    host, sep, port = value.rpartition(":")
+    if not sep or not host:
+        raise SystemExit(f"invalid target: {value!r}")
+    return host, int(port)
+
+def recv_exact(sock, size):
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise SystemExit("unexpected EOF from SOCKS5 proxy")
+        data += chunk
+    return data
+
+def socks_addr(host):
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        encoded = host.encode("idna")
+        if len(encoded) > 255:
+            raise SystemExit("target host is too long for SOCKS5")
+        return b"\x03" + bytes([len(encoded)]) + encoded
+    if ip.version == 4:
+        return b"\x01" + ip.packed
+    return b"\x04" + ip.packed
+
+target_host, target_port = split_host_port(target)
+if not 0 < target_port <= 65535:
+    raise SystemExit(f"invalid target port: {target_port}")
+
+with socket.create_connection((proxy_host, proxy_port), timeout=timeout) as sock:
     sock.settimeout(timeout)
     sock.sendall(b"\x05\x01\x00")
-    data = sock.recv(2)
+    data = recv_exact(sock, 2)
     if data != b"\x05\x00":
         raise SystemExit(f"unexpected SOCKS5 greeting response: {data!r}")
+    request = b"\x05\x01\x00" + socks_addr(target_host) + target_port.to_bytes(2, "big")
+    sock.sendall(request)
+    header = recv_exact(sock, 4)
+    if header[0] != 5:
+        raise SystemExit(f"unexpected SOCKS5 reply version: {header[0]}")
+    if header[1] != 0:
+        raise SystemExit(f"SOCKS5 CONNECT failed with reply code {header[1]}")
+    atyp = header[3]
+    if atyp == 1:
+        recv_exact(sock, 4)
+    elif atyp == 3:
+        recv_exact(sock, recv_exact(sock, 1)[0])
+    elif atyp == 4:
+        recv_exact(sock, 16)
+    else:
+        raise SystemExit(f"unexpected SOCKS5 reply address type: {atyp}")
+    recv_exact(sock, 2)
 PY
 }
 
 check_tcp_with_bash() {
   if command -v timeout >/dev/null 2>&1; then
-    timeout "${HEALTH_TIMEOUT}s" bash -c ":</dev/tcp/$HEALTH_HOST/$HEALTH_PORT"
+    timeout "${HEALTH_TIMEOUT}s" bash -c ':</dev/tcp/$1/$2' bash "$HEALTH_HOST" "$HEALTH_PORT"
   else
-    bash -c ":</dev/tcp/$HEALTH_HOST/$HEALTH_PORT"
+    bash -c ':</dev/tcp/$1/$2' bash "$HEALTH_HOST" "$HEALTH_PORT"
   fi
 }
 
-systemctl is-active --quiet "$SERVICE_NAME.service" || fail "$SERVICE_NAME.service is not active"
+service_state="$(systemctl is-active "$SERVICE_NAME.service" || true)"
+case "$service_state" in
+  active)
+    ;;
+  inactive)
+    log INFO "$SERVICE_NAME.service is inactive; assuming it was stopped intentionally"
+    exit 0
+    ;;
+  *)
+    fail "$SERVICE_NAME.service is $service_state"
+    ;;
+esac
 
 parse_listen "$LISTEN"
 if [[ -z "$HEALTH_PORT" || ! "$HEALTH_PORT" =~ ^[0-9]+$ ]]; then
@@ -300,13 +407,16 @@ if [[ -z "$HEALTH_PORT" || ! "$HEALTH_PORT" =~ ^[0-9]+$ ]]; then
 fi
 
 if command -v python3 >/dev/null 2>&1; then
-  check_socks_with_python || fail "SOCKS5 health check failed at $HEALTH_HOST:$HEALTH_PORT"
+  check_socks_with_python || fail "SOCKS5 CONNECT health check failed at $HEALTH_HOST:$HEALTH_PORT target=$HEALTH_TARGET"
 else
+  if [[ "$HEALTH_VERBOSE" == "1" || "$HEALTH_VERBOSE" == "true" ]]; then
+    log WARN "python3 missing; falling back to local TCP health check without upstream CONNECT"
+  fi
   check_tcp_with_bash || fail "TCP health check failed at $HEALTH_HOST:$HEALTH_PORT"
 fi
 
 if [[ "$HEALTH_VERBOSE" == "1" || "$HEALTH_VERBOSE" == "true" ]]; then
-  log INFO "$SERVICE_NAME healthy at $HEALTH_HOST:$HEALTH_PORT"
+  log INFO "$SERVICE_NAME healthy at $HEALTH_HOST:$HEALTH_PORT target=$HEALTH_TARGET"
 fi
 EOF
   chmod 0755 "$health_script"
@@ -401,6 +511,7 @@ install_all() {
   ensure_service_user
   resolve_service_group
   ensure_dirs
+  load_existing_env_file
   build_binary
   write_env_file
   write_run_script
@@ -432,6 +543,7 @@ run_as_service_user() {
 
 login_service_user() {
   need_root
+  load_existing_env_file
   [[ -x "$BIN_PATH" ]] || build_binary
   need_cmd systemctl
   need_cmd useradd

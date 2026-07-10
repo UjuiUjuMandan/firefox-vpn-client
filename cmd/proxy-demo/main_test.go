@@ -761,3 +761,26 @@ func TestProxyControllerSkipsRebuildWhenSessionAlreadyReplaced(t *testing.T) {
 		t.Fatalf("expected rebuild to be skipped, got %d rebuilds", rebuilds.Load())
 	}
 }
+
+func TestProxyControllerSleepOrDoneWakesOnClose(t *testing.T) {
+	t.Parallel()
+
+	controller := &proxyController{done: make(chan struct{})}
+	done := make(chan bool, 1)
+	go func() {
+		done <- controller.sleepOrDone(time.Hour)
+	}()
+
+	if err := controller.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	select {
+	case keptGoing := <-done:
+		if keptGoing {
+			t.Fatal("expected sleepOrDone to stop after Close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sleepOrDone did not wake after Close")
+	}
+}

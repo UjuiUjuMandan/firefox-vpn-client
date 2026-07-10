@@ -90,6 +90,21 @@ func TestDetectProxyPassClaimTimeOffsetUsesExpiryWhenStartClaimsMissing(t *testi
 	}
 }
 
+func TestDetectProxyPassClaimTimeOffsetCorrectsSkewWhenLocalZoneIsUTC(t *testing.T) {
+	now := time.Date(2026, 7, 2, 14, 36, 51, 0, time.UTC)
+	rawIat := time.Date(2026, 7, 2, 6, 36, 35, 0, time.UTC)
+	rawExp := time.Date(2026, 7, 2, 6, 46, 35, 0, time.UTC)
+	claims := ProxyPassClaims{
+		Iat: rawIat.Unix(),
+		Exp: rawExp.Unix(),
+	}
+
+	got := detectProxyPassClaimTimeOffset(claims, now)
+	if got != 8*time.Hour {
+		t.Fatalf("expected 8h claim time correction, got %s", got)
+	}
+}
+
 func TestDetectProxyPassClaimTimeOffsetLeavesFreshExpiryWithoutStartClaims(t *testing.T) {
 	previousLocal := time.Local
 	local := time.FixedZone("CST", 8*60*60)

@@ -2,6 +2,7 @@ package vpnclient
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -59,10 +60,42 @@ func saveTokens(tok *TokenResponse) error {
 		return err
 	}
 	path := tokenFilePath()
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := writePrivateFile(path, data); err != nil {
 		return fmt.Errorf("saving tokens to %s: %w", path, err)
 	}
 	return nil
+}
+
+func writePrivateFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return err
+		}
+		if retryErr := os.Rename(tmpPath, path); retryErr != nil {
+			return retryErr
+		}
+	}
+	return os.Chmod(path, 0600)
 }
 
 func deleteTokens() {

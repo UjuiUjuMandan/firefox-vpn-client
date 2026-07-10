@@ -118,12 +118,13 @@ VERBOSE=0
 HEALTH_INTERVAL=30s
 HEALTH_TIMEOUT=5
 HEALTH_VERBOSE=0
+HEALTH_TARGET=example.com:443
 EXTRA_ARGS=
 ```
 
 ## 升级
 
-拉取新代码后重新安装即可。token 和配置默认保留。
+拉取新代码后重新安装即可。token 和 `/etc/default/firefox-vpn-client` 里的现有配置默认保留；如果执行安装命令时显式传入同名环境变量，则以本次传入值为准。
 
 ```bash
 git pull
@@ -145,9 +146,11 @@ timer 默认每 30 秒运行一次。
 
 1. 确认 `firefox-vpn-client.service` 处于 active。
 2. 连接 `LISTEN` 地址。
-3. 如果有 `python3`，执行 SOCKS5 greeting 检查。
-4. 没有 `python3` 时退化为 TCP 端口检查。
+3. 如果有 `python3`，执行 SOCKS5 greeting，并通过代理 CONNECT 到 `HEALTH_TARGET`。
+4. 没有 `python3` 时退化为本地 TCP 端口检查，不验证上游出口。
 5. 失败则执行 `systemctl restart firefox-vpn-client.service`。
+
+如果主服务处于 `inactive`，健康检查会认为它是被手动停止的，不会通过 timer 重新拉起。
 
 默认健康成功不会刷日志；需要成功日志时设置：
 

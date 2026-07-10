@@ -48,19 +48,19 @@ type remoteSettingsResponse struct {
 }
 
 func fetchServerList() ([]Country, error) {
-	resp, err := http.Get(remoteSettingsURL)
+	resp, err := getControlPlane(remoteSettingsURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetching server list: %w", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("server list returned HTTP %d: %s", resp.StatusCode, readErrorBody(resp.Body))
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading server list response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("server list returned HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var rsResp remoteSettingsResponse
