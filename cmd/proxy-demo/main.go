@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,6 +50,7 @@ const (
 const (
 	proxyPassRenewLead          = 2 * time.Minute
 	proxyPassRetryDelay         = 30 * time.Second
+	proxyPassRenewTimeout       = 2 * time.Minute
 	oauthRefreshLead            = 2 * time.Minute
 	maxOpenTunnelRebuildRetries = 3
 	defaultHandshakeTimeout     = 10 * time.Second
@@ -154,6 +157,7 @@ func main() {
 	idleTimeoutFlag := flag.Duration("idle-timeout", defaultIdleTimeout, "Maximum idle time for an established tunnel; 0 disables the limit")
 	maxConnsFlag := flag.Int("max-conns", defaultMaxConnections, "Maximum concurrent client connections; 0 disables the limit")
 	upstreamConnsFlag := flag.Int("upstream-conns", defaultUpstreamConnections, "Number of upstream proxy sessions to keep open; values above 1 can improve parallel throughput")
+	statusFileFlag := flag.String("status-file", "", "Write runtime health status JSON to this file; disabled when empty")
 	useH3Flag := flag.Bool("h3", false, "Use HTTP/3 (QUIC/UDP) instead of HTTP/2 (TCP) for the upstream connection")
 	verboseFlag := flag.Bool("verbose", false, "Enable verbose per-connection logs, including CONNECT target hosts")
 	flag.Parse()
@@ -209,13 +213,14 @@ func main() {
 	}
 	sessionStart := time.Now()
 	controller, err := newProxyController(proxyControllerConfig{
-		Guardian: *guardianFlag,
-		ProxyURL: proxyURL,
-		Timeout:  *timeoutFlag,
-		Auth:     runtimeAuth,
-		Pass:     pass,
-		UseH3:    *useH3Flag,
-		Sessions: *upstreamConnsFlag,
+		Guardian:   *guardianFlag,
+		ProxyURL:   proxyURL,
+		Timeout:    *timeoutFlag,
+		Auth:       runtimeAuth,
+		Pass:       pass,
+		UseH3:      *useH3Flag,
+		Sessions:   *upstreamConnsFlag,
+		StatusFile: strings.TrimSpace(*statusFileFlag),
 	})
 	if err != nil {
 		switch {
@@ -1614,13 +1619,14 @@ type managedSession struct {
 }
 
 type proxyControllerConfig struct {
-	Guardian string
-	ProxyURL *url.URL
-	Timeout  time.Duration
-	Auth     *runtimeAuth
-	Pass     *vpnclient.ProxyPassInfo
-	UseH3    bool
-	Sessions int
+	Guardian   string
+	ProxyURL   *url.URL
+	Timeout    time.Duration
+	Auth       *runtimeAuth
+	Pass       *vpnclient.ProxyPassInfo
+	UseH3      bool
+	Sessions   int
+	StatusFile string
 }
 
 type proxyController struct {
@@ -1631,15 +1637,25 @@ type proxyController struct {
 	sessionFactory func(token string) (proxySession, error)
 	refreshSession func() error
 
-	renewMu sync.Mutex
-	mu      sync.Mutex
-	auth    *runtimeAuth
-	current *managedSession
-	closed  bool
-	done    chan struct{}
+	renewMu    sync.Mutex
+	mu         sync.Mutex
+	auth       *runtimeAuth
+	current    *managedSession
+	statusFile string
+	closed     bool
+	done       chan struct{}
 
 	closeOnce sync.Once
 	closeErr  error
+}
+
+type proxyRuntimeStatus struct {
+	UpdatedAt          string `json:"updated_at"`
+	PID                int    `json:"pid"`
+	ProxyPassExpiresAt string `json:"proxy_pass_expires_at"`
+	SecondsUntilExpiry int64  `json:"seconds_until_expiry"`
+	Accepting          bool   `json:"accepting"`
+	Reason             string `json:"reason"`
 }
 
 func newProxyController(cfg proxyControllerConfig) (*proxyController, error) {
@@ -1671,19 +1687,22 @@ func newProxyController(cfg proxyControllerConfig) (*proxyController, error) {
 		return nil, err
 	}
 
-	return &proxyController{
+	controller := &proxyController{
 		guardian:       cfg.Guardian,
 		proxyURL:       cfg.ProxyURL,
 		timeout:        cfg.Timeout,
 		sessionFactory: factory,
 		auth:           cfg.Auth,
+		statusFile:     cfg.StatusFile,
 		done:           make(chan struct{}),
 		current: &managedSession{
 			session:   session,
 			expiresAt: cfg.Pass.ExpiresAt(),
 			accepting: true,
 		},
-	}, nil
+	}
+	controller.writeStatus("startup")
+	return controller, nil
 }
 
 func (c *proxyController) OpenTunnel(authority string) (net.Conn, error) {
@@ -1782,8 +1801,6 @@ func (c *proxyController) maybeCloseLocked(ms *managedSession) {
 
 func (c *proxyController) swapSession(newSession proxySession, expiresAt time.Time) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	old := c.current
 	c.current = &managedSession{
 		session:   newSession,
@@ -1794,15 +1811,21 @@ func (c *proxyController) swapSession(newSession proxySession, expiresAt time.Ti
 		old.accepting = false
 		c.maybeCloseLocked(old)
 	}
+	c.mu.Unlock()
+	c.writeStatus("session_swapped")
 }
 
 func (c *proxyController) disableExpiredSession(now time.Time) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	changed := false
 	if c.current != nil && c.current.accepting && !now.Before(c.current.expiresAt) {
 		c.current.accepting = false
 		c.maybeCloseLocked(c.current)
+		changed = true
+	}
+	c.mu.Unlock()
+	if changed {
+		c.writeStatus("expired")
 	}
 }
 
@@ -1813,6 +1836,73 @@ func (c *proxyController) currentExpiry() time.Time {
 		return time.Time{}
 	}
 	return c.current.expiresAt
+}
+
+func (c *proxyController) currentStatus(reason string) proxyRuntimeStatus {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	status := proxyRuntimeStatus{
+		UpdatedAt: time.Now().Format(time.RFC3339),
+		PID:       os.Getpid(),
+		Reason:    reason,
+	}
+	if c.current != nil {
+		status.ProxyPassExpiresAt = c.current.expiresAt.Format(time.RFC3339)
+		status.SecondsUntilExpiry = int64(time.Until(c.current.expiresAt).Round(time.Second) / time.Second)
+		status.Accepting = c.current.accepting
+	}
+	return status
+}
+
+func (c *proxyController) writeStatus(reason string) {
+	if c.statusFile == "" {
+		return
+	}
+	status := c.currentStatus(reason)
+	if err := c.writeStatusFile(status); err != nil {
+		logWarn("writing status file failed path=%s err=%s", c.statusFile, logErr(err))
+	}
+}
+
+func (c *proxyController) writeStatusFile(status proxyRuntimeStatus) error {
+	if c.statusFile == "" {
+		return nil
+	}
+	data, err := json.MarshalIndent(status, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	dir := filepath.Dir(c.statusFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(c.statusFile)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, c.statusFile); err != nil {
+		if removeErr := os.Remove(c.statusFile); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			_ = os.Remove(tmpName)
+			return err
+		}
+		if retryErr := os.Rename(tmpName, c.statusFile); retryErr != nil {
+			_ = os.Remove(tmpName)
+			return retryErr
+		}
+	}
+	return nil
 }
 
 func (c *proxyController) hasUsableSessionOtherThan(failedSession *managedSession, now time.Time) bool {
@@ -1833,11 +1923,17 @@ func (c *proxyController) runRenewalLoop() {
 		if c.isClosed() {
 			return
 		}
+		expiry := c.currentExpiry()
 		sleep := c.nextRenewalDelay()
+		logInfo("proxy pass renewal scheduled next_expiry=%s delay=%s", expiry.Format(time.RFC3339), sleep)
 		if !c.sleepOrDone(sleep) {
 			return
 		}
-		if err := c.renew(); err != nil {
+		logInfo("proxy pass renewal starting")
+		if err, timedOut := c.renewWithTimeout(proxyPassRenewTimeout); timedOut {
+			logError("proxy pass renewal timed out after %s; exiting for supervisor restart", proxyPassRenewTimeout)
+			os.Exit(1)
+		} else if err != nil {
 			now := time.Now()
 			logWarn("proxy pass renewal failed: %s", logErr(err))
 			c.disableExpiredSession(now)
@@ -1847,6 +1943,29 @@ func (c *proxyController) runRenewalLoop() {
 			}
 			continue
 		}
+	}
+}
+
+func (c *proxyController) renewWithTimeout(timeout time.Duration) (error, bool) {
+	if timeout <= 0 {
+		return c.renew(), false
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		resultCh <- c.renew()
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-resultCh:
+		return err, false
+	case <-timer.C:
+		return nil, true
+	case <-c.done:
+		return nil, false
 	}
 }
 
@@ -1986,6 +2105,7 @@ func (c *proxyController) Close() error {
 			c.current.session = nil
 		}
 	})
+	c.writeStatus("closed")
 	return c.closeErr
 }
 

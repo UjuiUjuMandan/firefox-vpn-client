@@ -34,6 +34,7 @@ go run ./cmd/proxy-demo -listen 127.0.0.1:1088
 -idle-timeout 0               # 已建立隧道的空闲超时，0 表示关闭限制
 -max-conns 256                # 最大并发客户端连接数，0 表示关闭限制
 -upstream-conns 1             # 上游 proxy session 数量，提高并发吞吐时可设为 2-4
+-status-file PATH             # 写入运行状态，systemd 健康检查用来判断 proxy pass 是否过期
 -verbose                      # 打印完整 CONNECT 目标，默认会打码
 ```
 
@@ -122,7 +123,10 @@ VERBOSE=0
 HEALTH_INTERVAL=30s
 HEALTH_TIMEOUT=5
 HEALTH_VERBOSE=0
-HEALTH_TARGET=example.com:443
+HEALTH_TARGET=
+HEALTH_TARGETS=www.google.com:443,example.com:443
+HEALTH_STATUS_GRACE=30
+STATUS_FILE=/var/lib/firefox-vpn-client/status.json
 EXTRA_ARGS=
 ```
 
@@ -168,10 +172,13 @@ timer 默认每 30 秒运行一次。
 检查逻辑：
 
 1. 确认 `firefox-vpn-client.service` 处于 active。
-2. 连接 `LISTEN` 地址。
-3. 如果有 `python3`，执行 SOCKS5 greeting，并通过代理 CONNECT 到 `HEALTH_TARGET`。
-4. 没有 `python3` 时退化为本地 TCP 端口检查，不验证上游出口。
-5. 失败则执行 `systemctl restart firefox-vpn-client.service`。
+2. 如果有 `python3`，读取 `STATUS_FILE`，确认当前 proxy pass 没有超过 `proxy_pass_expires_at + HEALTH_STATUS_GRACE`。
+3. 连接 `LISTEN` 地址。
+4. 如果有 `python3`，执行 SOCKS5 greeting，并通过代理 CONNECT 到 `HEALTH_TARGETS` 里的每个目标。
+5. 没有 `python3` 时退化为本地 TCP 端口检查，不验证 proxy pass 过期和上游出口。
+6. 失败则执行 `systemctl restart firefox-vpn-client.service`。
+
+`HEALTH_TARGET` 是旧的单目标配置；如果设置了 `HEALTH_TARGETS`，优先使用 `HEALTH_TARGETS`。不要把经常间歇性 502 的目标放进健康检查，否则会触发不必要的重启。
 
 如果主服务处于 `inactive`，健康检查会认为它是被手动停止的，不会通过 timer 重新拉起。
 

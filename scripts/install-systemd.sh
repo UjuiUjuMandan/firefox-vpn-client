@@ -28,6 +28,9 @@ CONFIG_KEYS=(
   HEALTH_TIMEOUT
   HEALTH_VERBOSE
   HEALTH_TARGET
+  HEALTH_TARGETS
+  HEALTH_STATUS_GRACE
+  STATUS_FILE
 )
 
 declare -A EXPLICIT_CONFIG
@@ -51,7 +54,17 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 HEALTH_INTERVAL="${HEALTH_INTERVAL:-30s}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-5}"
 HEALTH_VERBOSE="${HEALTH_VERBOSE:-0}"
-HEALTH_TARGET="${HEALTH_TARGET:-example.com:443}"
+HEALTH_TARGET="${HEALTH_TARGET:-}"
+HEALTH_TARGETS="${HEALTH_TARGETS:-}"
+if [[ -z "$HEALTH_TARGETS" ]]; then
+  if [[ -n "$HEALTH_TARGET" ]]; then
+    HEALTH_TARGETS="$HEALTH_TARGET"
+  else
+    HEALTH_TARGETS="www.google.com:443,example.com:443"
+  fi
+fi
+HEALTH_STATUS_GRACE="${HEALTH_STATUS_GRACE:-30}"
+STATUS_FILE="${STATUS_FILE:-$STATE_DIR/status.json}"
 PURGE="${PURGE:-0}"
 SKIP_START="${SKIP_START:-0}"
 
@@ -95,6 +108,9 @@ Common environment overrides:
   HEALTH_TIMEOUT=$HEALTH_TIMEOUT
   HEALTH_VERBOSE=$HEALTH_VERBOSE
   HEALTH_TARGET=$HEALTH_TARGET
+  HEALTH_TARGETS=$HEALTH_TARGETS
+  HEALTH_STATUS_GRACE=$HEALTH_STATUS_GRACE
+  STATUS_FILE=$STATUS_FILE
   EXTRA_ARGS="$EXTRA_ARGS"
 
 Examples:
@@ -211,6 +227,9 @@ write_env_file() {
     write_env_var HEALTH_TIMEOUT "$HEALTH_TIMEOUT"
     write_env_var HEALTH_VERBOSE "$HEALTH_VERBOSE"
     write_env_var HEALTH_TARGET "$HEALTH_TARGET"
+    write_env_var HEALTH_TARGETS "$HEALTH_TARGETS"
+    write_env_var HEALTH_STATUS_GRACE "$HEALTH_STATUS_GRACE"
+    write_env_var STATUS_FILE "$STATUS_FILE"
   } > "$ENV_FILE"
   chmod 0644 "$ENV_FILE"
 }
@@ -237,8 +256,9 @@ HANDSHAKE_TIMEOUT="${HANDSHAKE_TIMEOUT:-10s}"
 MAX_CONNS="${MAX_CONNS:-256}"
 UPSTREAM_CONNS="${UPSTREAM_CONNS:-1}"
 IDLE_TIMEOUT="${IDLE_TIMEOUT:-0}"
+STATUS_FILE="${STATUS_FILE:-}"
 
-args=(-listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -idle-timeout "$IDLE_TIMEOUT" -max-conns "$MAX_CONNS" -upstream-conns "$UPSTREAM_CONNS")
+args=(-listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -idle-timeout "$IDLE_TIMEOUT" -max-conns "$MAX_CONNS" -upstream-conns "$UPSTREAM_CONNS" -status-file "$STATUS_FILE")
 
 if [[ -n "${PROXY:-}" ]]; then
   args+=(-proxy "$PROXY")
@@ -283,6 +303,16 @@ fi
 LISTEN="${LISTEN:-127.0.0.1:1080}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-5}"
 HEALTH_VERBOSE="${HEALTH_VERBOSE:-0}"
+STATUS_FILE="${STATUS_FILE:-}"
+HEALTH_STATUS_GRACE="${HEALTH_STATUS_GRACE:-30}"
+HEALTH_TARGETS="${HEALTH_TARGETS:-}"
+if [[ -z "$HEALTH_TARGETS" ]]; then
+  if [[ -n "${HEALTH_TARGET:-}" ]]; then
+    HEALTH_TARGETS="$HEALTH_TARGET"
+  else
+    HEALTH_TARGETS="www.google.com:443,example.com:443"
+  fi
+fi
 
 log() {
   printf '%s %-5s %s\n' "$(date -Is)" "$1" "$2"
@@ -321,7 +351,8 @@ parse_listen() {
 }
 
 check_socks_with_python() {
-  python3 - "$HEALTH_HOST" "$HEALTH_PORT" "$HEALTH_TIMEOUT" "$HEALTH_TARGET" <<'PY'
+  local target="$1"
+  python3 - "$HEALTH_HOST" "$HEALTH_PORT" "$HEALTH_TIMEOUT" "$target" <<'PY'
 import ipaddress
 import socket
 import sys
@@ -390,6 +421,32 @@ with socket.create_connection((proxy_host, proxy_port), timeout=timeout) as sock
 PY
 }
 
+check_status_with_python() {
+  [[ -r "$STATUS_FILE" ]] || return 1
+  python3 - "$STATUS_FILE" "$HEALTH_STATUS_GRACE" <<'PY'
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+
+status_file = sys.argv[1]
+grace = int(sys.argv[2])
+
+with open(status_file, "r", encoding="utf-8") as fh:
+    status = json.load(fh)
+
+expiry_text = status.get("proxy_pass_expires_at")
+if not expiry_text:
+    raise SystemExit("missing proxy_pass_expires_at in status file")
+
+expiry = datetime.fromisoformat(expiry_text.replace("Z", "+00:00"))
+now = datetime.now(timezone.utc)
+if expiry.tzinfo is None:
+    expiry = expiry.replace(tzinfo=timezone.utc)
+if now > expiry + timedelta(seconds=grace):
+    raise SystemExit(f"proxy pass expired at {expiry.isoformat()}")
+PY
+}
+
 check_tcp_with_bash() {
   if command -v timeout >/dev/null 2>&1; then
     timeout "${HEALTH_TIMEOUT}s" bash -c ':</dev/tcp/$1/$2' bash "$HEALTH_HOST" "$HEALTH_PORT"
@@ -417,7 +474,16 @@ if [[ -z "$HEALTH_PORT" || ! "$HEALTH_PORT" =~ ^[0-9]+$ ]]; then
 fi
 
 if command -v python3 >/dev/null 2>&1; then
-  check_socks_with_python || fail "SOCKS5 CONNECT health check failed at $HEALTH_HOST:$HEALTH_PORT target=$HEALTH_TARGET"
+  if [[ -n "$STATUS_FILE" ]]; then
+    check_status_with_python || fail "status file is stale or unreadable: $STATUS_FILE"
+  fi
+  IFS=',' read -r -a HEALTH_TARGET_LIST <<< "$HEALTH_TARGETS"
+  for target in "${HEALTH_TARGET_LIST[@]}"; do
+    target="${target#"${target%%[![:space:]]*}"}"
+    target="${target%"${target##*[![:space:]]}"}"
+    [[ -n "$target" ]] || continue
+    check_socks_with_python "$target" || fail "SOCKS5 CONNECT health check failed at $HEALTH_HOST:$HEALTH_PORT target=$target"
+  done
 else
   if [[ "$HEALTH_VERBOSE" == "1" || "$HEALTH_VERBOSE" == "true" ]]; then
     log WARN "python3 missing; falling back to local TCP health check without upstream CONNECT"
@@ -567,7 +633,7 @@ login_service_user() {
   write_healthcheck_script
   write_units
 
-  local -a args=(-login -print-info -listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -idle-timeout "$IDLE_TIMEOUT" -max-conns "$MAX_CONNS" -upstream-conns "$UPSTREAM_CONNS")
+  local -a args=(-login -print-info -listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -idle-timeout "$IDLE_TIMEOUT" -max-conns "$MAX_CONNS" -upstream-conns "$UPSTREAM_CONNS" -status-file "$STATUS_FILE")
   if [[ -n "$PROXY" ]]; then
     args+=(-proxy "$PROXY")
   fi

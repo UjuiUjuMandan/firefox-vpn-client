@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1020,5 +1023,76 @@ func TestProxyControllerSleepOrDoneWakesOnClose(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("sleepOrDone did not wake after Close")
+	}
+}
+
+func TestProxyControllerWritesStatusFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	statusFile := filepath.Join(dir, "status.json")
+	controller := &proxyController{
+		statusFile: statusFile,
+		current: &managedSession{
+			session:   &fakeProxySession{},
+			expiresAt: time.Now().Add(10 * time.Minute),
+			accepting: true,
+		},
+	}
+
+	controller.writeStatus("startup")
+	controller.writeStatus("renewed")
+
+	data, err := os.ReadFile(statusFile)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	var status proxyRuntimeStatus
+	if err := json.Unmarshal(data, &status); err != nil {
+		t.Fatalf("json.Unmarshal returned error: %v", err)
+	}
+	if status.Reason != "renewed" {
+		t.Fatalf("expected reason renewed, got %q", status.Reason)
+	}
+	if status.ProxyPassExpiresAt == "" {
+		t.Fatal("expected proxy_pass_expires_at to be populated")
+	}
+	if !status.Accepting {
+		t.Fatal("expected accepting=true")
+	}
+}
+
+func TestProxyControllerRenewWithTimeoutTimesOut(t *testing.T) {
+	t.Parallel()
+
+	controller := &proxyController{done: make(chan struct{})}
+	controller.renewMu.Lock()
+	defer controller.renewMu.Unlock()
+
+	timedOutCh := make(chan bool, 1)
+	go func() {
+		_, timedOut := controller.renewWithTimeout(20 * time.Millisecond)
+		timedOutCh <- timedOut
+	}()
+
+	select {
+	case timedOut := <-timedOutCh:
+		if !timedOut {
+			t.Fatal("expected renewWithTimeout to time out")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("renewWithTimeout did not return")
+	}
+}
+
+func TestProxyControllerRenewWithTimeoutStopsWhenClosed(t *testing.T) {
+	t.Parallel()
+
+	controller := &proxyController{done: make(chan struct{})}
+	close(controller.done)
+
+	_, timedOut := controller.renewWithTimeout(time.Hour)
+	if timedOut {
+		t.Fatal("expected closed controller not to report renewal timeout")
 	}
 }
