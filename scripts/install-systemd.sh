@@ -18,7 +18,9 @@ CONFIG_KEYS=(
   GUARDIAN
   TIMEOUT
   HANDSHAKE_TIMEOUT
+  IDLE_TIMEOUT
   MAX_CONNS
+  UPSTREAM_CONNS
   USE_H3
   VERBOSE
   EXTRA_ARGS
@@ -40,7 +42,9 @@ PROXY="${PROXY:-}"
 GUARDIAN="${GUARDIAN:-}"
 TIMEOUT="${TIMEOUT:-20s}"
 HANDSHAKE_TIMEOUT="${HANDSHAKE_TIMEOUT:-10s}"
+IDLE_TIMEOUT="${IDLE_TIMEOUT:-0}"
 MAX_CONNS="${MAX_CONNS:-256}"
+UPSTREAM_CONNS="${UPSTREAM_CONNS:-1}"
 USE_H3="${USE_H3:-0}"
 VERBOSE="${VERBOSE:-0}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -82,7 +86,9 @@ Common environment overrides:
   PROXY=$PROXY
   TIMEOUT=$TIMEOUT
   HANDSHAKE_TIMEOUT=$HANDSHAKE_TIMEOUT
+  IDLE_TIMEOUT=$IDLE_TIMEOUT
   MAX_CONNS=$MAX_CONNS
+  UPSTREAM_CONNS=$UPSTREAM_CONNS
   USE_H3=$USE_H3
   VERBOSE=$VERBOSE
   HEALTH_INTERVAL=$HEALTH_INTERVAL
@@ -195,7 +201,9 @@ write_env_file() {
     write_env_var GUARDIAN "$GUARDIAN"
     write_env_var TIMEOUT "$TIMEOUT"
     write_env_var HANDSHAKE_TIMEOUT "$HANDSHAKE_TIMEOUT"
+    write_env_var IDLE_TIMEOUT "$IDLE_TIMEOUT"
     write_env_var MAX_CONNS "$MAX_CONNS"
+    write_env_var UPSTREAM_CONNS "$UPSTREAM_CONNS"
     write_env_var USE_H3 "$USE_H3"
     write_env_var VERBOSE "$VERBOSE"
     write_env_var EXTRA_ARGS "$EXTRA_ARGS"
@@ -227,8 +235,10 @@ LISTEN="${LISTEN:-127.0.0.1:1080}"
 TIMEOUT="${TIMEOUT:-20s}"
 HANDSHAKE_TIMEOUT="${HANDSHAKE_TIMEOUT:-10s}"
 MAX_CONNS="${MAX_CONNS:-256}"
+UPSTREAM_CONNS="${UPSTREAM_CONNS:-1}"
+IDLE_TIMEOUT="${IDLE_TIMEOUT:-0}"
 
-args=(-listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -max-conns "$MAX_CONNS")
+args=(-listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -idle-timeout "$IDLE_TIMEOUT" -max-conns "$MAX_CONNS" -upstream-conns "$UPSTREAM_CONNS")
 
 if [[ -n "${PROXY:-}" ]]; then
   args+=(-proxy "$PROXY")
@@ -452,6 +462,7 @@ ProtectSystem=full
 ProtectHome=true
 ReadWritePaths=$STATE_DIR
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -556,7 +567,7 @@ login_service_user() {
   write_healthcheck_script
   write_units
 
-  local -a args=(-login -print-info -listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -max-conns "$MAX_CONNS")
+  local -a args=(-login -print-info -listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -idle-timeout "$IDLE_TIMEOUT" -max-conns "$MAX_CONNS" -upstream-conns "$UPSTREAM_CONNS")
   if [[ -n "$PROXY" ]]; then
     args+=(-proxy "$PROXY")
   fi

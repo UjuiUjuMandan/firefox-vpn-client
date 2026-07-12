@@ -6,7 +6,7 @@
 
 - 登录 Firefox Account，获取 OAuth token 和 Guardian proxy pass。
 - 本地暴露 SOCKS5 CONNECT 代理。
-- 上游使用单条 HTTP/2 或 HTTP/3 CONNECT session。
+- 上游使用 HTTP/2 或 HTTP/3 CONNECT session；高并发时可开启上游 session 池。
 - proxy pass 后台续期；OpenTunnel 失败时会重建上游 session 并重试。
 - Linux 可通过 systemd 常驻运行，附带健康检查和自动重启。
 
@@ -31,7 +31,9 @@ go run ./cmd/proxy-demo -listen 127.0.0.1:1088
 -h3                           # 使用 HTTP/3/QUIC
 -timeout 20s                  # 上游拨号、握手、CONNECT 打开阶段超时
 -handshake-timeout 10s        # 客户端 SOCKS5 握手超时
+-idle-timeout 0               # 已建立隧道的空闲超时，0 表示关闭限制
 -max-conns 256                # 最大并发客户端连接数，0 表示关闭限制
+-upstream-conns 1             # 上游 proxy session 数量，提高并发吞吐时可设为 2-4
 -verbose                      # 打印完整 CONNECT 目标，默认会打码
 ```
 
@@ -112,7 +114,9 @@ LISTEN=127.0.0.1:1088
 PROXY=
 TIMEOUT=20s
 HANDSHAKE_TIMEOUT=10s
+IDLE_TIMEOUT=0
 MAX_CONNS=256
+UPSTREAM_CONNS=1
 USE_H3=0
 VERBOSE=0
 HEALTH_INTERVAL=30s
@@ -121,6 +125,25 @@ HEALTH_VERBOSE=0
 HEALTH_TARGET=example.com:443
 EXTRA_ARGS=
 ```
+
+## 性能调优
+
+默认配置偏保守，适合单用户或低并发。作为 sing-box 出口或多客户端共享时，可以先从下面的配置开始：
+
+```bash
+MAX_CONNS=1024
+UPSTREAM_CONNS=4
+IDLE_TIMEOUT=5m
+VERBOSE=0
+```
+
+调优建议：
+
+- `UPSTREAM_CONNS` 会建立多条到同一 Fastly proxy 的 HTTP/2/HTTP/3 上游 session。多连接下载、多客户端并发时通常比单 session 更稳。
+- `MAX_CONNS` 需要小于系统文件句柄上限；systemd unit 默认设置 `LimitNOFILE=65535`。
+- `IDLE_TIMEOUT=5m` 会清理长时间无流量的已建立隧道，避免客户端或 sing-box 遗留连接占满并发槽；默认 `0` 更适合 SSH、WebSocket 等长连接。
+- `VERBOSE=1` 会增加日志 IO 和锁竞争，只建议临时排障开启。
+- 性能差时优先固定实测低延迟的 `PROXY=`，随机节点可能选到 Fastly 内部绕路严重的出口。
 
 ## 升级
 

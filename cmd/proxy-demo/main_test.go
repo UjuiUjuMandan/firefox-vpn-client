@@ -404,6 +404,244 @@ func (c *fakeNetConn) SetDeadline(time.Time) error      { return nil }
 func (c *fakeNetConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *fakeNetConn) SetWriteDeadline(time.Time) error { return nil }
 
+type fakeHalfCloseConn struct {
+	fakeNetConn
+	closeReadCount  atomic.Int32
+	closeWriteCount atomic.Int32
+}
+
+func (c *fakeHalfCloseConn) CloseRead() error {
+	c.closeReadCount.Add(1)
+	return nil
+}
+
+func (c *fakeHalfCloseConn) CloseWrite() error {
+	c.closeWriteCount.Add(1)
+	return nil
+}
+
+type halfCloseTestConn interface {
+	net.Conn
+	CloseRead() error
+	CloseWrite() error
+}
+
+func TestTunnelWrappersForwardHalfCloseAndReleaseOnClose(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		conn func(*fakeHalfCloseConn, *atomic.Int32) halfCloseTestConn
+	}{
+		{
+			name: "pooled",
+			conn: func(underlying *fakeHalfCloseConn, releaseCount *atomic.Int32) halfCloseTestConn {
+				return &pooledTunnelConn{
+					Conn: underlying,
+					release: func() {
+						releaseCount.Add(1)
+					},
+				}
+			},
+		},
+		{
+			name: "managed",
+			conn: func(underlying *fakeHalfCloseConn, releaseCount *atomic.Int32) halfCloseTestConn {
+				return &managedTunnelConn{
+					Conn: underlying,
+					release: func() {
+						releaseCount.Add(1)
+					},
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			underlying := &fakeHalfCloseConn{}
+			var releaseCount atomic.Int32
+			conn := tc.conn(underlying, &releaseCount)
+
+			assertHalfCloseForwarding(t, conn, underlying, &releaseCount)
+		})
+	}
+}
+
+func assertHalfCloseForwarding(t *testing.T, conn halfCloseTestConn, underlying *fakeHalfCloseConn, releaseCount *atomic.Int32) {
+	t.Helper()
+
+	if err := conn.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite returned error: %v", err)
+	}
+	if got := underlying.closeWriteCount.Load(); got != 1 {
+		t.Fatalf("expected underlying CloseWrite once, got %d", got)
+	}
+
+	if err := conn.CloseRead(); err != nil {
+		t.Fatalf("CloseRead returned error: %v", err)
+	}
+	if got := underlying.closeReadCount.Load(); got != 1 {
+		t.Fatalf("expected underlying CloseRead once, got %d", got)
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("second Close returned error: %v", err)
+	}
+	if got := releaseCount.Load(); got != 1 {
+		t.Fatalf("expected pooled session release once, got %d", got)
+	}
+}
+
+func TestProxySessionPoolDistributesTunnels(t *testing.T) {
+	t.Parallel()
+
+	sessions := []*fakeProxySession{{}, {}, {}}
+	var created atomic.Int32
+	pool, err := newProxySessionPool(len(sessions), func() (proxySession, error) {
+		idx := int(created.Add(1)) - 1
+		return sessions[idx], nil
+	})
+	if err != nil {
+		t.Fatalf("newProxySessionPool returned error: %v", err)
+	}
+	defer pool.Close()
+
+	for i := 0; i < 6; i++ {
+		conn, err := pool.OpenTunnel("example.com:443")
+		if err != nil {
+			t.Fatalf("OpenTunnel %d returned error: %v", i, err)
+		}
+		_ = conn.Close()
+	}
+
+	for i, session := range sessions {
+		if got := session.openCount.Load(); got != 2 {
+			t.Fatalf("expected session %d open count 2, got %d", i, got)
+		}
+	}
+}
+
+func TestProxySessionPoolSkipsBrokenSession(t *testing.T) {
+	t.Parallel()
+
+	broken := &fakeProxySession{openErr: errors.New("transport closed")}
+	healthy := &fakeProxySession{}
+	replacement := &fakeProxySession{}
+	sessions := []*fakeProxySession{broken, healthy, replacement}
+	var created atomic.Int32
+	pool, err := newProxySessionPool(2, func() (proxySession, error) {
+		idx := int(created.Add(1)) - 1
+		return sessions[idx], nil
+	})
+	if err != nil {
+		t.Fatalf("newProxySessionPool returned error: %v", err)
+	}
+	defer pool.Close()
+
+	conn, err := pool.OpenTunnel("example.com:443")
+	if err != nil {
+		t.Fatalf("OpenTunnel returned error: %v", err)
+	}
+	_ = conn.Close()
+
+	if got := healthy.openCount.Load(); got != 1 {
+		t.Fatalf("expected healthy session open count 1, got %d", got)
+	}
+	if err := pool.Close(); err != nil {
+		t.Fatalf("pool Close returned error: %v", err)
+	}
+	if got := broken.closeCount.Load(); got != 1 {
+		t.Fatalf("expected broken session to be closed once, got %d", got)
+	}
+}
+
+func TestProxySessionPoolStartsWithPartialSuccess(t *testing.T) {
+	t.Parallel()
+
+	session := &fakeProxySession{}
+	var attempts atomic.Int32
+	pool, err := newProxySessionPool(3, func() (proxySession, error) {
+		n := attempts.Add(1)
+		if n == 1 {
+			return session, nil
+		}
+		return nil, errors.New("temporary dial failure")
+	})
+	if err != nil {
+		t.Fatalf("newProxySessionPool returned error: %v", err)
+	}
+	defer pool.Close()
+
+	conn, err := pool.OpenTunnel("example.com:443")
+	if err != nil {
+		t.Fatalf("OpenTunnel returned error: %v", err)
+	}
+	_ = conn.Close()
+	if got := session.openCount.Load(); got != 1 {
+		t.Fatalf("expected available session open count 1, got %d", got)
+	}
+}
+
+func TestProxySessionPoolReplenishesBrokenSession(t *testing.T) {
+	t.Parallel()
+
+	broken := &fakeProxySession{openErr: errors.New("transport closed")}
+	healthy := &fakeProxySession{}
+	replacement := &fakeProxySession{}
+	sessions := []*fakeProxySession{broken, healthy, replacement}
+	var created atomic.Int32
+	pool, err := newProxySessionPool(2, func() (proxySession, error) {
+		idx := int(created.Add(1)) - 1
+		if idx >= len(sessions) {
+			return nil, errors.New("unexpected extra create")
+		}
+		return sessions[idx], nil
+	})
+	if err != nil {
+		t.Fatalf("newProxySessionPool returned error: %v", err)
+	}
+	defer pool.Close()
+
+	conn, err := pool.OpenTunnel("example.com:443")
+	if err != nil {
+		t.Fatalf("OpenTunnel returned error: %v", err)
+	}
+	_ = conn.Close()
+
+	waitForCondition(t, time.Second, func() bool {
+		return created.Load() >= 3
+	})
+
+	for i := 0; i < 2; i++ {
+		conn, err := pool.OpenTunnel("example.org:443")
+		if err != nil {
+			t.Fatalf("OpenTunnel after replenish returned error: %v", err)
+		}
+		_ = conn.Close()
+	}
+	if got := replacement.openCount.Load(); got == 0 {
+		t.Fatal("expected replenished session to receive a tunnel")
+	}
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if ok() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition was not met before timeout")
+}
+
 func TestTunnelConnCloseWriteClosesRequestBody(t *testing.T) {
 	t.Parallel()
 

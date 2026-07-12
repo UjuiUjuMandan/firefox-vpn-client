@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	vpnclient "firefox-vpn-client"
@@ -50,7 +51,11 @@ const (
 	oauthRefreshLead            = 2 * time.Minute
 	maxOpenTunnelRebuildRetries = 3
 	defaultHandshakeTimeout     = 10 * time.Second
+	defaultIdleTimeout          = 0
 	defaultMaxConnections       = 256
+	defaultUpstreamConnections  = 1
+	upstreamSessionRetryDelay   = 10 * time.Second
+	copyBufferSize              = 64 * 1024
 )
 
 var (
@@ -61,6 +66,12 @@ var (
 	verboseLogs              bool
 	logMu                    sync.Mutex
 )
+
+var copyBufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, copyBufferSize)
+	},
+}
 
 func logEvent(level, format string, args ...any) {
 	message := fmt.Sprintf(format, args...)
@@ -127,7 +138,7 @@ func main() {
 		fmt.Fprintln(out, "  proxy-demo [-proxy https://HOST:PORT] [-listen 127.0.0.1:1080] [-h3] [-print-info]")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "This program logs in to Firefox Accounts, fetches a VPN proxy pass, and")
-		fmt.Fprintln(out, "exposes a local SOCKS5 CONNECT proxy over a single upstream HTTP/2 or HTTP/3 connection.")
+		fmt.Fprintln(out, "exposes a local SOCKS5 CONNECT proxy over one or more upstream HTTP/2 or HTTP/3 connections.")
 		fmt.Fprintln(out)
 		flag.PrintDefaults()
 	}
@@ -140,11 +151,21 @@ func main() {
 	proxyFlag := flag.String("proxy", "", "Upstream proxy URL or host:port; random CONNECT server if omitted")
 	timeoutFlag := flag.Duration("timeout", 20*time.Second, "Upstream dial and handshake timeout")
 	handshakeTimeoutFlag := flag.Duration("handshake-timeout", defaultHandshakeTimeout, "Maximum time allowed for a client SOCKS5 handshake; 0 disables the limit")
+	idleTimeoutFlag := flag.Duration("idle-timeout", defaultIdleTimeout, "Maximum idle time for an established tunnel; 0 disables the limit")
 	maxConnsFlag := flag.Int("max-conns", defaultMaxConnections, "Maximum concurrent client connections; 0 disables the limit")
+	upstreamConnsFlag := flag.Int("upstream-conns", defaultUpstreamConnections, "Number of upstream proxy sessions to keep open; values above 1 can improve parallel throughput")
 	useH3Flag := flag.Bool("h3", false, "Use HTTP/3 (QUIC/UDP) instead of HTTP/2 (TCP) for the upstream connection")
 	verboseFlag := flag.Bool("verbose", false, "Enable verbose per-connection logs, including CONNECT target hosts")
 	flag.Parse()
 	verboseLogs = *verboseFlag
+	if *upstreamConnsFlag < 1 {
+		logError("invalid -upstream-conns %d: must be at least 1", *upstreamConnsFlag)
+		os.Exit(1)
+	}
+	if *idleTimeoutFlag < 0 {
+		logError("invalid -idle-timeout %s: must not be negative", idleTimeoutFlag.String())
+		os.Exit(1)
+	}
 
 	runtimeAuth, tokenSource, countries := prepareDemoInputs(
 		*loginFlag,
@@ -194,6 +215,7 @@ func main() {
 		Auth:     runtimeAuth,
 		Pass:     pass,
 		UseH3:    *useH3Flag,
+		Sessions: *upstreamConnsFlag,
 	})
 	if err != nil {
 		switch {
@@ -217,20 +239,22 @@ func main() {
 	}
 	defer ln.Close()
 
-	logInfo("SOCKS5 proxy started listen=%s upstream=%s auth_source=%q proxy_pass_exp=%s max_conns=%d handshake_timeout=%s connect_timeout=%s verbose=%v",
+	logInfo("SOCKS5 proxy started listen=%s upstream=%s auth_source=%q proxy_pass_exp=%s max_conns=%d upstream_conns=%d handshake_timeout=%s idle_timeout=%s connect_timeout=%s verbose=%v",
 		ln.Addr().String(),
 		selectedProxy.Addr,
 		tokenSource,
 		pass.ExpiresAt().Format(time.RFC3339),
 		*maxConnsFlag,
+		*upstreamConnsFlag,
 		handshakeTimeoutFlag.String(),
+		idleTimeoutFlag.String(),
 		timeoutFlag.String(),
 		verboseLogs,
 	)
 	if *useH3Flag {
-		logInfo("transport=http3 mode=single-upstream-connection renewal=background")
+		logInfo("transport=http3 mode=%s renewal=background", upstreamMode(*upstreamConnsFlag))
 	} else {
-		logInfo("transport=http2 mode=single-upstream-connection renewal=background")
+		logInfo("transport=http2 mode=%s renewal=background", upstreamMode(*upstreamConnsFlag))
 	}
 	logInfo("exit selected country=%q country_code=%s city=%q city_code=%s proxy=%s local_to_exit_latency=%s",
 		selectedProxy.CountryNameOrUnknown(),
@@ -241,7 +265,7 @@ func main() {
 		localToExitLatency,
 	)
 
-	server := newSocksServer(controller, *handshakeTimeoutFlag, *maxConnsFlag)
+	server := newSocksServer(controller, *handshakeTimeoutFlag, *idleTimeoutFlag, *maxConnsFlag)
 
 	for {
 		conn, err := ln.Accept()
@@ -333,6 +357,13 @@ func logProxyPassTimeCorrection(pass *vpnclient.ProxyPassInfo) {
 		return
 	}
 	logWarn("proxy pass JWT claim time correction applied offset=%s expires_at=%s", pass.ClaimTimeCorrection(), pass.ExpiresAt().Format(time.RFC3339))
+}
+
+func upstreamMode(sessions int) string {
+	if sessions <= 1 {
+		return "single-upstream-connection"
+	}
+	return fmt.Sprintf("upstream-session-pool size=%d", sessions)
 }
 
 func obtainOAuthToken(forceLogin bool) (*vpnclient.TokenResponse, string) {
@@ -540,6 +571,294 @@ type proxySession interface {
 	Close() error
 }
 
+type pooledProxySession struct {
+	mu      sync.Mutex
+	session proxySession
+	healthy bool
+	retired bool
+	refs    int
+}
+
+type proxySessionPool struct {
+	create   func() (proxySession, error)
+	sessions []*pooledProxySession
+	next     atomic.Uint64
+
+	mu        sync.Mutex
+	closed    bool
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newProxySessionPool(size int, create func() (proxySession, error)) (*proxySessionPool, error) {
+	if size < 1 {
+		return nil, fmt.Errorf("upstream session pool size must be at least 1")
+	}
+
+	pool := &proxySessionPool{
+		create:   create,
+		sessions: make([]*pooledProxySession, size),
+		done:     make(chan struct{}),
+	}
+	successes := 0
+	var firstErr error
+	for i := 0; i < size; i++ {
+		session, err := create()
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			logWarn("creating upstream session failed slot=%d size=%d err=%s", i+1, size, logErr(err))
+			continue
+		}
+		pool.sessions[i] = newPooledProxySession(session)
+		successes++
+	}
+	if successes == 0 {
+		_ = pool.Close()
+		return nil, fmt.Errorf("creating upstream session pool: %w", firstErr)
+	}
+	if successes < size {
+		logWarn("upstream proxy session pool partially established available=%d desired=%d", successes, size)
+		for i := range pool.sessions {
+			if pool.sessions[i] == nil {
+				go pool.replenishSlot(i)
+			}
+		}
+	} else {
+		logInfo("upstream proxy session pool established size=%d", successes)
+	}
+	return pool, nil
+}
+
+func newPooledProxySession(session proxySession) *pooledProxySession {
+	return &pooledProxySession{
+		session: session,
+		healthy: true,
+	}
+}
+
+func (p *proxySessionPool) OpenTunnel(authority string) (net.Conn, error) {
+	if p == nil || len(p.sessions) == 0 {
+		return nil, errNoUsableProxySession
+	}
+
+	start := int((p.next.Add(1) - 1) % uint64(len(p.sessions)))
+	var lastErr error
+	for i := 0; i < len(p.sessions); i++ {
+		slot := (start + i) % len(p.sessions)
+		pooled := p.slot(slot)
+		if pooled == nil {
+			continue
+		}
+		session, ok := pooled.acquire()
+		if !ok {
+			continue
+		}
+		conn, err := session.OpenTunnel(authority)
+		if err == nil {
+			return &pooledTunnelConn{
+				Conn:    conn,
+				release: pooled.release,
+			}, nil
+		}
+		pooled.release()
+		lastErr = err
+		if !shouldRebuildProxySession(err) {
+			return nil, err
+		}
+		p.retireSlot(slot, pooled)
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errNoUsableProxySession
+}
+
+func (p *proxySessionPool) Close() error {
+	if p == nil {
+		return nil
+	}
+	var sessions []*pooledProxySession
+	p.closeOnce.Do(func() {
+		close(p.done)
+		p.mu.Lock()
+		p.closed = true
+		sessions = append(sessions, p.sessions...)
+		for i := range p.sessions {
+			p.sessions[i] = nil
+		}
+		p.mu.Unlock()
+	})
+	var err error
+	for _, pooled := range sessions {
+		if pooled == nil {
+			continue
+		}
+		if closeErr := pooled.closeNow(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
+}
+
+func (p *proxySessionPool) slot(i int) *pooledProxySession {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || i < 0 || i >= len(p.sessions) {
+		return nil
+	}
+	return p.sessions[i]
+}
+
+func (p *proxySessionPool) retireSlot(i int, expected *pooledProxySession) {
+	expected.retire()
+
+	p.mu.Lock()
+	if p.closed || i < 0 || i >= len(p.sessions) || p.sessions[i] != expected {
+		p.mu.Unlock()
+		return
+	}
+	p.sessions[i] = nil
+	p.mu.Unlock()
+
+	go p.replenishSlot(i)
+}
+
+func (p *proxySessionPool) replenishSlot(i int) {
+	for {
+		p.mu.Lock()
+		if p.closed || i < 0 || i >= len(p.sessions) || p.sessions[i] != nil {
+			p.mu.Unlock()
+			return
+		}
+		p.mu.Unlock()
+
+		session, err := p.create()
+		if err != nil {
+			logWarn("replenishing upstream session failed slot=%d err=%s", i+1, logErr(err))
+			if !p.waitOrClosed(upstreamSessionRetryDelay) {
+				return
+			}
+			continue
+		}
+
+		pooled := newPooledProxySession(session)
+		p.mu.Lock()
+		if p.closed || p.sessions[i] != nil {
+			p.mu.Unlock()
+			_ = pooled.closeNow()
+			return
+		}
+		p.sessions[i] = pooled
+		p.mu.Unlock()
+		logInfo("upstream proxy session replenished slot=%d", i+1)
+		return
+	}
+}
+
+func (p *proxySessionPool) waitOrClosed(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-p.done:
+		return false
+	}
+}
+
+func (p *pooledProxySession) acquire() (proxySession, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.healthy || p.retired || p.session == nil {
+		return nil, false
+	}
+	p.refs++
+	return p.session, true
+}
+
+func (p *pooledProxySession) release() {
+	session := p.releaseLocked()
+	if session != nil {
+		_ = session.Close()
+	}
+}
+
+func (p *pooledProxySession) releaseLocked() proxySession {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.refs > 0 {
+		p.refs--
+	}
+	if p.refs == 0 && p.retired && p.session != nil {
+		session := p.session
+		p.session = nil
+		return session
+	}
+	return nil
+}
+
+func (p *pooledProxySession) retire() {
+	p.mu.Lock()
+	p.healthy = false
+	p.retired = true
+	shouldClose := p.refs == 0 && p.session != nil
+	var session proxySession
+	if shouldClose {
+		session = p.session
+		p.session = nil
+	}
+	p.mu.Unlock()
+	if session != nil {
+		_ = session.Close()
+	}
+}
+
+func (p *pooledProxySession) closeNow() error {
+	p.mu.Lock()
+	session := p.session
+	p.session = nil
+	p.healthy = false
+	p.retired = true
+	p.mu.Unlock()
+	if session == nil {
+		return nil
+	}
+	return session.Close()
+}
+
+type pooledTunnelConn struct {
+	net.Conn
+	release func()
+	once    sync.Once
+}
+
+func (c *pooledTunnelConn) Close() error {
+	var err error
+	c.once.Do(func() {
+		err = c.Conn.Close()
+		if c.release != nil {
+			c.release()
+		}
+	})
+	return err
+}
+
+func (c *pooledTunnelConn) CloseRead() error {
+	if closeReader, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return closeReader.CloseRead()
+	}
+	return nil
+}
+
+func (c *pooledTunnelConn) CloseWrite() error {
+	if closeWriter, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closeWriter.CloseWrite()
+	}
+	return nil
+}
+
 type runtimeAuth struct {
 	Token      *vpnclient.TokenResponse
 	ObtainedAt time.Time
@@ -556,10 +875,11 @@ func (a *runtimeAuth) accessTokenValid(now time.Time) bool {
 type socksServer struct {
 	upstream         tunnelOpener
 	handshakeTimeout time.Duration
+	idleTimeout      time.Duration
 	connSlots        chan struct{}
 }
 
-func newSocksServer(upstream tunnelOpener, handshakeTimeout time.Duration, maxConns int) *socksServer {
+func newSocksServer(upstream tunnelOpener, handshakeTimeout, idleTimeout time.Duration, maxConns int) *socksServer {
 	var slots chan struct{}
 	if maxConns > 0 {
 		slots = make(chan struct{}, maxConns)
@@ -567,6 +887,7 @@ func newSocksServer(upstream tunnelOpener, handshakeTimeout time.Duration, maxCo
 	return &socksServer{
 		upstream:         upstream,
 		handshakeTimeout: handshakeTimeout,
+		idleTimeout:      idleTimeout,
 		connSlots:        slots,
 	}
 }
@@ -637,7 +958,7 @@ func (s *socksServer) handleConn(conn net.Conn) {
 	}
 
 	logDebug("upstream tunnel open succeeded client=%s target=%s", clientAddr, logTarget(target))
-	proxyBidirectional(conn, upstreamConn)
+	proxyBidirectional(conn, upstreamConn, s.idleTimeout)
 	logDebug("client disconnected client=%s target=%s duration=%s", clientAddr, logTarget(target), time.Since(start).Round(time.Millisecond))
 }
 
@@ -862,27 +1183,93 @@ func roundTripWithOpenTimeout(timeout time.Duration, do func(context.Context) (*
 	}
 }
 
-func proxyBidirectional(clientConn, upstreamConn net.Conn) {
+func proxyBidirectional(clientConn, upstreamConn net.Conn, idleTimeout time.Duration) {
 	var wg sync.WaitGroup
 	wg.Add(2)
+	var activity func()
+	done := make(chan struct{})
+
+	if idleTimeout > 0 {
+		activityCh := make(chan struct{}, 1)
+		activity = func() {
+			select {
+			case activityCh <- struct{}{}:
+			default:
+			}
+		}
+		go closeIdleConns(clientConn, upstreamConn, idleTimeout, activityCh, done)
+	} else {
+		activity = func() {}
+	}
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(upstreamConn, clientConn)
-		if closeWriter, ok := upstreamConn.(interface{ CloseWrite() error }); ok {
-			_ = closeWriter.CloseWrite()
-		}
+		copyConn(upstreamConn, clientConn, activity)
+		closeWrite(upstreamConn)
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(clientConn, upstreamConn)
-		if closeWriter, ok := clientConn.(interface{ CloseWrite() error }); ok {
-			_ = closeWriter.CloseWrite()
-		}
+		copyConn(clientConn, upstreamConn, activity)
+		closeWrite(clientConn)
 	}()
 
 	wg.Wait()
+	close(done)
+}
+
+func closeIdleConns(clientConn, upstreamConn net.Conn, idleTimeout time.Duration, activity <-chan struct{}, done <-chan struct{}) {
+	timer := time.NewTimer(idleTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-activity:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(idleTimeout)
+		case <-timer.C:
+			_ = clientConn.Close()
+			_ = upstreamConn.Close()
+			return
+		case <-done:
+			return
+		}
+	}
+}
+
+func copyConn(dst, src net.Conn, activity func()) {
+	buf := copyBufferPool.Get().([]byte)
+	defer copyBufferPool.Put(buf)
+
+	for {
+		nr, readErr := src.Read(buf)
+		if nr > 0 {
+			activity()
+			nw, writeErr := dst.Write(buf[:nr])
+			if nw > 0 {
+				activity()
+			}
+			if writeErr != nil {
+				return
+			}
+			if nw != nr {
+				return
+			}
+		}
+		if readErr != nil {
+			return
+		}
+	}
+}
+
+func closeWrite(conn net.Conn) {
+	if closeWriter, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = closeWriter.CloseWrite()
+	}
 }
 
 type h2ProxySession struct {
@@ -1233,6 +1620,7 @@ type proxyControllerConfig struct {
 	Auth     *runtimeAuth
 	Pass     *vpnclient.ProxyPassInfo
 	UseH3    bool
+	Sessions int
 }
 
 type proxyController struct {
@@ -1255,15 +1643,27 @@ type proxyController struct {
 }
 
 func newProxyController(cfg proxyControllerConfig) (*proxyController, error) {
-	var factory func(token string) (proxySession, error)
+	var baseFactory func(token string) (proxySession, error)
 	if cfg.UseH3 {
-		factory = func(token string) (proxySession, error) {
+		baseFactory = func(token string) (proxySession, error) {
 			return newH3ProxySession(cfg.ProxyURL, token, cfg.Timeout)
 		}
 	} else {
-		factory = func(token string) (proxySession, error) {
+		baseFactory = func(token string) (proxySession, error) {
 			return newH2ProxySession(cfg.ProxyURL, token, cfg.Timeout)
 		}
+	}
+	sessions := cfg.Sessions
+	if sessions < 1 {
+		sessions = defaultUpstreamConnections
+	}
+	factory := func(token string) (proxySession, error) {
+		if sessions == 1 {
+			return baseFactory(token)
+		}
+		return newProxySessionPool(sessions, func() (proxySession, error) {
+			return baseFactory(token)
+		})
 	}
 
 	session, err := factory(cfg.Pass.RawToken)
@@ -1604,4 +2004,18 @@ func (c *managedTunnelConn) Close() error {
 		}
 	})
 	return err
+}
+
+func (c *managedTunnelConn) CloseRead() error {
+	if closeReader, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return closeReader.CloseRead()
+	}
+	return nil
+}
+
+func (c *managedTunnelConn) CloseWrite() error {
+	if closeWriter, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closeWriter.CloseWrite()
+	}
+	return nil
 }
