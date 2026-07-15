@@ -21,14 +21,19 @@ go run ./cmd/proxy-demo -login -print-info
 启动本地 SOCKS5：
 
 ```bash
-go run ./cmd/proxy-demo -listen 127.0.0.1:1088
+go run ./cmd/proxy-demo -country US -listen 127.0.0.1:1088
 ```
+
+首次选点必须明确指定 `-country` 或 `-proxy`。程序不会再从全球节点中随机选择国家；选定结果写入 `-proxy-state-file` 后，后续启动会优先复用该 hostname。
 
 常用参数：
 
 ```bash
--proxy HOST:PORT              # 指定出口 proxy；systemd 未指定时会持久化首次成功选择
--proxy-state-file PATH        # 保存自动选择的 proxy，重启后优先复用
+-country US                   # 按 Mozilla server list 的国家代码或名称选择位置
+-proxy HOST:PORT              # 精确指定上游 proxy；与 -country 互斥
+-proxy-state-file PATH        # 保存选择的 proxy hostname，重启后优先复用
+-verify-exit=true             # 通过代理验证实际公网出口 IP/国家；失败不影响服务
+-exit-check-timeout 10s       # 出口数据面探测超时
 -h3                           # 使用 HTTP/3/QUIC
 -timeout 20s                  # 上游拨号、握手、CONNECT 打开阶段超时
 -handshake-timeout 10s        # 客户端 SOCKS5 握手超时
@@ -39,35 +44,34 @@ go run ./cmd/proxy-demo -listen 127.0.0.1:1088
 -verbose                      # 打印完整 CONNECT 目标，默认会打码
 ```
 
-启动后日志会打印当前出口和本机到出口的建连延迟：
+启动后会分别记录配置位置、上游 session 建连耗时和真实出口探测：
 
 ```text
-INFO  exit selected country="Japan" country_code=JP city="Tokyo" city_code=tyo proxy=jp.example:443 local_to_exit_latency=183ms
+INFO  upstream selected configured_country="Japan" configured_country_code=JP configured_city="Japan" configured_city_code=RJTF proxy=rjtf770.m1.fastly-masque.net:2499 selection_source=configured_country upstream_session_establish_latency=183ms
+INFO  exit verified ip=203.0.113.10 country_code=JP data_path_probe_latency=241ms probe_host=www.cloudflare.com
 ```
 
-`local_to_exit_latency` 是建立上游 HTTP/2/TLS 或 HTTP/3/QUIC session 的耗时，不是 ICMP ping。
+`configured_country` 来自 Mozilla server list，只表示请求选择的位置。`upstream_session_establish_latency` 是建立上游 HTTP/2/TLS 或 HTTP/3/QUIC session 的耗时。`exit verified` 才是数据面实际看到的公网出口；`data_path_probe_latency` 包含经 VPN 出口访问探测站点的完整耗时，不等于 ICMP ping 或到某台 gateway 的纯 RTT。
 
-## 出口延迟与 Fastly 内部路径
+## Fastly POP、配置位置与实际出口
 
-如果 VPS 到 Fastly 入口很近，但 `local_to_exit_latency` 或经代理访问目标的延迟明显偏高，问题可能在 Fastly 内部路径，而不在 VPS 机房出口。
+这三个概念不能混为一谈：
 
-典型现象：
+- Mozilla server list 中选择的 VPN 国家和 hostname。
+- 流量进入 Fastly 网络时使用的 POP、site 和网络路径。
+- CONNECT/MASQUE 数据面最终使用的公网出口 IP。
 
-```text
-VPS -> 本地交换中心/Fastly 入口: <1ms
-Fastly 内部静默跳点
-到 MASQUE/CONNECT 终端: 100ms+
-```
+Fastly 的[官方 POP 文档](https://www.fastly.com/documentation/guides/getting-started/concepts/using-fastlys-global-pop-network/)说明，普通 Fastly 服务通常会把流量送到网络距离最近的 POP；一个 POP 可能包含多个物理 site，故障时路由也可能改变。该文档描述的是 Fastly 通用 CDN/反向代理模型，并没有确认 Mozilla MASQUE 使用集中式 gateway、标准 clustering 或 shielding。
 
-这表示流量很快进入了 Fastly 网络，但 Fastly 可能把 Firefox VPN 的 CONNECT/MASQUE 流量转发到某个远端 gateway 再出网。这个 gateway 不一定和 VPS 所在城市相同，也不一定是最近的普通 CDN 边缘节点。
+例如 `lfpb115.m1.fastly-masque.net` 中的 `LFPB115` 被 Fastly 官方列表列为 Paris metro POP 的一个物理 site。美国 VPS 选择法国位置后出现约 100ms 以上延迟，首先应解释为选择了远端服务位置，而不是直接断言 Fastly 在本地入口后又绕到集中式 gateway。
 
 排查建议：
 
-- 不要只看 `mtr` 中间跳；Fastly 内部跳点可能静默，ICMP 也不等同于 CONNECT/MASQUE 实际路径。
-- 以程序日志里的 `local_to_exit_latency`、经 SOCKS 访问目标站的 RTT、下载速度作为主要判断依据。
-- `PROXY=` 为空时首次启动会随机选择 CONNECT server；systemd 会保存到 `PROXY_STATE_FILE`，后续重启优先复用同一节点。持久化节点连续 3 次启动失败后才会清除并重新选择，避免一次临时丢包触发出口漂移。
-- 需要稳定出口时，优先固定一个实测延迟低的 `PROXY=HOST:PORT`。
-- 如果同一国家的多个节点全部高延迟，通常是 Fastly 对当前 VPS 线路的内部调度问题，客户端侧很难强制它落到本地 gateway。
+- 不要用 `mtr` 某两个 hop 的 RTT 差值直接推导 Fastly 内部增加了多少延迟；ICMP 限速、隐藏 hop 和回程不对称都会干扰结果。
+- 优先比较 `upstream_session_establish_latency`、`data_path_probe_latency`、经 SOCKS 访问多个目标的耗时和下载速度。
+- `PROXY_STATE_FILE` 只固定 hostname 和位置元数据，不能保证固定 Fastly 机器、物理 site、网络路径或公网出口 IP。
+- 需要稳定位置时设置 `COUNTRY=US` 等明确国家；需要固定精确 hostname 时设置 `PROXY=HOST:PORT`。
+- 只有在同一配置位置、多个 hostname、多个目标和多个时间段都复现异常后，才把 Fastly 内部路径或服务端 gateway 调度列为可能原因。
 
 ## systemd 部署
 
@@ -80,7 +84,7 @@ scripts/install-systemd.sh
 推荐第一次部署：
 
 ```bash
-sudo LISTEN=127.0.0.1:1088 ./scripts/install-systemd.sh install-login
+sudo COUNTRY=US LISTEN=127.0.0.1:1088 ./scripts/install-systemd.sh install-login
 ```
 
 这会：
@@ -114,6 +118,7 @@ sudo systemctl restart firefox-vpn-client.service
 ```bash
 LISTEN=127.0.0.1:1088
 PROXY=
+COUNTRY=US
 PROXY_STATE_FILE=/var/lib/firefox-vpn-client/proxy-selection.json
 TIMEOUT=20s
 HANDSHAKE_TIMEOUT=10s
@@ -121,6 +126,9 @@ IDLE_TIMEOUT=0
 MAX_CONNS=256
 UPSTREAM_CONNS=1
 USE_H3=0
+VERIFY_EXIT=1
+EXIT_CHECK_URL=https://www.cloudflare.com/cdn-cgi/trace
+EXIT_CHECK_TIMEOUT=10s
 VERBOSE=0
 HEALTH_INTERVAL=30s
 HEALTH_TIMEOUT=5
@@ -152,7 +160,7 @@ VERBOSE=0
 - `MAX_CONNS` 需要小于系统文件句柄上限；systemd unit 默认设置 `LimitNOFILE=65535`。
 - `IDLE_TIMEOUT=5m` 会清理长时间无流量的已建立隧道，避免客户端或 sing-box 遗留连接占满并发槽；默认 `0` 更适合 SSH、WebSocket 等长连接。
 - `VERBOSE=1` 会增加日志 IO 和锁竞争，只建议临时排障开启。
-- 性能差时优先固定实测低延迟的 `PROXY=`；未固定时会复用 `PROXY_STATE_FILE` 中上次成功的自动选择。
+- 性能差时先确认 `COUNTRY` 是预期位置，再比较同一国家的 hostname；需要精确复用时设置 `PROXY=`。`PROXY_STATE_FILE` 只能提供 hostname 级别的尽力复用。
 
 ## 稳定性策略
 
@@ -160,11 +168,13 @@ VERBOSE=0
 - H2 空闲 30 秒会发送 PING，15 秒未收到响应会关闭半开连接。
 - 同一个目标反复 502/超时不会触发换出口；同一 session 上至少 3 个不同目标连续失败才判定为 session 级故障。
 - 双向转发发生异常错误时会立即关闭两端；正常半关闭最多排空 2 分钟，防止连接和 `MAX_CONNS` 槽位永久泄漏。
-- systemd 自动选点会持久化；节点连续 3 次启动失败后才重新选择。
+- systemd 会持久化选中的 hostname；连续 3 次启动失败后才清除选择并按 `COUNTRY` 重新选择，但这不承诺固定物理节点或公网出口 IP。
 
 ## 升级
 
 拉取新代码后重新安装即可。token 和 `/etc/default/firefox-vpn-client` 里的现有配置默认保留；如果执行安装命令时显式传入同名环境变量，则以本次传入值为准。
+
+旧版本已经生成 `PROXY_STATE_FILE` 时可以继续启动，但建议尽快在环境文件中补上明确的 `COUNTRY`。如果旧的持久化选择连续启动失败并被清除，没有 `COUNTRY` 的新版本会拒绝重新随机选择全球节点。
 
 ```bash
 git pull
@@ -238,18 +248,27 @@ target=<redacted; use -verbose>
 sudo ./scripts/install-systemd.sh login
 ```
 
-出口国家显示 `unknown`
+`selecting proxy failed: multiple VPN countries are available`
 
-通常是手动 `-proxy` 指定了不在 server list 里的 host，或者拉取 server list 失败。代理仍可运行，只是无法标注国家/城市。
+首次启动没有配置位置。手动运行时加 `-country US`，systemd 则在 `/etc/default/firefox-vpn-client` 设置 `COUNTRY=US`。也可以用 `PROXY=HOST:PORT` 精确指定 hostname。
+
+配置位置显示 `unknown`
+
+通常是手动 `-proxy` 指定了不在 Mozilla server list 里的 host，或者启动时无法获取位置元数据。代理仍可运行；以 `exit verified` 的实际探测结果为准。
+
+`exit verification failed`
+
+出口验证是非致命探测，不会阻止 SOCKS5 服务启动。先检查目标站是否可达；如果不希望依赖外部探测，设置 `VERIFY_EXIT=0`。关闭后程序只会报告配置位置和上游 session 建连耗时，不会声称已经确认实际出口。
 
 出口延迟异常高
 
-如果 `mtr` 显示 VPS 到本地 Fastly 入口很低，但最终到 `*.m1.fastly-masque.net` 或出口路径突然增加 100ms 以上，通常是 Fastly 内部把 CONNECT/MASQUE 流量转到了远端 gateway。优先处理：
+如果 `*.m1.fastly-masque.net` 建连或数据面探测增加 100ms 以上，先确认没有选择远离 VPS 的配置国家。仅凭 `mtr` 不能证明 Fastly 使用集中式 MASQUE gateway。优先处理：
 
 - 用 `-print-info` 查看可用节点。
-- 手动指定多个同区域节点测试。
+- 检查 `COUNTRY`、`configured_country_code` 和 `exit verified country_code` 是否一致。
+- 手动指定同一国家的多个 hostname 测试。
 - 把最低延迟的节点写入 `/etc/default/firefox-vpn-client` 的 `PROXY=`。
-- 重启服务后确认日志里的 `exit selected ... proxy=... local_to_exit_latency=...`。
+- 重启服务后同时比较 `upstream_session_establish_latency` 和 `data_path_probe_latency`。
 
 服务启动后立即重启
 
@@ -264,6 +283,7 @@ sudo journalctl -u firefox-vpn-client.service -n 100 --no-pager
 - `/etc/default/firefox-vpn-client`
 - `/var/lib/firefox-vpn-client/.firefox-vpn-tokens.json`
 - `LISTEN` 端口是否被占用
+- `COUNTRY` 或 `PROXY` 是否已配置
 - `PROXY` 是否可达
 
 ## 卸载

@@ -15,6 +15,7 @@ HEALTH_TIMER_FILE="${HEALTH_TIMER_FILE:-/etc/systemd/system/$SERVICE_NAME-health
 CONFIG_KEYS=(
   LISTEN
   PROXY
+  COUNTRY
   PROXY_STATE_FILE
   GUARDIAN
   TIMEOUT
@@ -23,6 +24,9 @@ CONFIG_KEYS=(
   MAX_CONNS
   UPSTREAM_CONNS
   USE_H3
+  VERIFY_EXIT
+  EXIT_CHECK_URL
+  EXIT_CHECK_TIMEOUT
   VERBOSE
   EXTRA_ARGS
   HEALTH_INTERVAL
@@ -45,6 +49,7 @@ done
 
 LISTEN="${LISTEN:-127.0.0.1:1080}"
 PROXY="${PROXY:-}"
+COUNTRY="${COUNTRY:-}"
 PROXY_STATE_FILE="${PROXY_STATE_FILE:-$STATE_DIR/proxy-selection.json}"
 GUARDIAN="${GUARDIAN:-}"
 TIMEOUT="${TIMEOUT:-20s}"
@@ -53,6 +58,9 @@ IDLE_TIMEOUT="${IDLE_TIMEOUT:-0}"
 MAX_CONNS="${MAX_CONNS:-256}"
 UPSTREAM_CONNS="${UPSTREAM_CONNS:-1}"
 USE_H3="${USE_H3:-0}"
+VERIFY_EXIT="${VERIFY_EXIT:-1}"
+EXIT_CHECK_URL="${EXIT_CHECK_URL:-https://www.cloudflare.com/cdn-cgi/trace}"
+EXIT_CHECK_TIMEOUT="${EXIT_CHECK_TIMEOUT:-10s}"
 VERBOSE="${VERBOSE:-0}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 HEALTH_INTERVAL="${HEALTH_INTERVAL:-30s}"
@@ -103,6 +111,7 @@ Common environment overrides:
   BIN_PATH=$BIN_PATH
   LISTEN=$LISTEN
   PROXY=$PROXY
+  COUNTRY=$COUNTRY
   PROXY_STATE_FILE=$PROXY_STATE_FILE
   TIMEOUT=$TIMEOUT
   HANDSHAKE_TIMEOUT=$HANDSHAKE_TIMEOUT
@@ -110,6 +119,9 @@ Common environment overrides:
   MAX_CONNS=$MAX_CONNS
   UPSTREAM_CONNS=$UPSTREAM_CONNS
   USE_H3=$USE_H3
+  VERIFY_EXIT=$VERIFY_EXIT
+  EXIT_CHECK_URL=$EXIT_CHECK_URL
+  EXIT_CHECK_TIMEOUT=$EXIT_CHECK_TIMEOUT
   VERBOSE=$VERBOSE
   HEALTH_INTERVAL=$HEALTH_INTERVAL
   HEALTH_TIMEOUT=$HEALTH_TIMEOUT
@@ -123,7 +135,7 @@ Common environment overrides:
   EXTRA_ARGS="$EXTRA_ARGS"
 
 Examples:
-  sudo LISTEN=127.0.0.1:1088 ./scripts/install-systemd.sh install-login
+  sudo COUNTRY=US LISTEN=127.0.0.1:1088 ./scripts/install-systemd.sh install-login
   sudo USE_H3=1 VERBOSE=1 ./scripts/install-systemd.sh install
   sudo ./scripts/install-systemd.sh status
 EOF
@@ -223,6 +235,7 @@ write_env_file() {
     write_env_var BIN_PATH "$BIN_PATH"
     write_env_var LISTEN "$LISTEN"
     write_env_var PROXY "$PROXY"
+    write_env_var COUNTRY "$COUNTRY"
     write_env_var PROXY_STATE_FILE "$PROXY_STATE_FILE"
     write_env_var GUARDIAN "$GUARDIAN"
     write_env_var TIMEOUT "$TIMEOUT"
@@ -231,6 +244,9 @@ write_env_file() {
     write_env_var MAX_CONNS "$MAX_CONNS"
     write_env_var UPSTREAM_CONNS "$UPSTREAM_CONNS"
     write_env_var USE_H3 "$USE_H3"
+    write_env_var VERIFY_EXIT "$VERIFY_EXIT"
+    write_env_var EXIT_CHECK_URL "$EXIT_CHECK_URL"
+    write_env_var EXIT_CHECK_TIMEOUT "$EXIT_CHECK_TIMEOUT"
     write_env_var VERBOSE "$VERBOSE"
     write_env_var EXTRA_ARGS "$EXTRA_ARGS"
     write_env_var HEALTH_INTERVAL "$HEALTH_INTERVAL"
@@ -270,11 +286,17 @@ UPSTREAM_CONNS="${UPSTREAM_CONNS:-1}"
 IDLE_TIMEOUT="${IDLE_TIMEOUT:-0}"
 STATUS_FILE="${STATUS_FILE:-}"
 PROXY_STATE_FILE="${PROXY_STATE_FILE:-}"
+COUNTRY="${COUNTRY:-}"
+VERIFY_EXIT="${VERIFY_EXIT:-1}"
+EXIT_CHECK_URL="${EXIT_CHECK_URL:-https://www.cloudflare.com/cdn-cgi/trace}"
+EXIT_CHECK_TIMEOUT="${EXIT_CHECK_TIMEOUT:-10s}"
 
-args=(-listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -idle-timeout "$IDLE_TIMEOUT" -max-conns "$MAX_CONNS" -upstream-conns "$UPSTREAM_CONNS" -status-file "$STATUS_FILE" -proxy-state-file "$PROXY_STATE_FILE")
+args=(-listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -idle-timeout "$IDLE_TIMEOUT" -max-conns "$MAX_CONNS" -upstream-conns "$UPSTREAM_CONNS" -status-file "$STATUS_FILE" -proxy-state-file "$PROXY_STATE_FILE" -verify-exit="$VERIFY_EXIT" -exit-check-url "$EXIT_CHECK_URL" -exit-check-timeout "$EXIT_CHECK_TIMEOUT")
 
 if [[ -n "${PROXY:-}" ]]; then
   args+=(-proxy "$PROXY")
+elif [[ -n "$COUNTRY" ]]; then
+  args+=(-country "$COUNTRY")
 fi
 if [[ -n "${GUARDIAN:-}" ]]; then
   args+=(-guardian "$GUARDIAN")
@@ -649,6 +671,15 @@ has_tokens() {
   [[ -s "$(token_file)" ]]
 }
 
+has_location_selection() {
+  [[ -n "$PROXY" || -n "$COUNTRY" || -s "$PROXY_STATE_FILE" ]]
+}
+
+require_location_selection() {
+  [[ -z "$PROXY" || -z "$COUNTRY" ]] || die "PROXY and COUNTRY are mutually exclusive; configure only one"
+  has_location_selection || die "no VPN location configured; set COUNTRY=US (or another country code) or PROXY=HOST:PORT before starting the service"
+}
+
 daemon_reload() {
   systemctl daemon-reload
 }
@@ -677,11 +708,12 @@ install_all() {
   if [[ "$SKIP_START" == "1" ]]; then
     log "installed but start skipped by SKIP_START=1"
   elif has_tokens; then
+    require_location_selection
     log "token file exists; enabling and starting service"
     enable_and_start
   else
     log "installed but not started: token file is missing at $(token_file)"
-    log "run: sudo $0 login"
+    log "run: sudo COUNTRY=US $0 login"
   fi
 }
 
@@ -714,6 +746,8 @@ login_service_user() {
   local -a args=(-login -print-info -listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -idle-timeout "$IDLE_TIMEOUT" -max-conns "$MAX_CONNS" -upstream-conns "$UPSTREAM_CONNS" -status-file "$STATUS_FILE" -proxy-state-file "$PROXY_STATE_FILE")
   if [[ -n "$PROXY" ]]; then
     args+=(-proxy "$PROXY")
+  elif [[ -n "$COUNTRY" ]]; then
+    args+=(-country "$COUNTRY")
   fi
   if [[ -n "$GUARDIAN" ]]; then
     args+=(-guardian "$GUARDIAN")
@@ -722,6 +756,7 @@ login_service_user() {
     args+=(-h3)
   fi
 
+  require_location_selection
   log "starting interactive login as $SERVICE_USER; token will be saved to $(token_file)"
   systemctl stop "$SERVICE_NAME.service" >/dev/null 2>&1 || true
   run_as_service_user "$BIN_PATH" "${args[@]}"

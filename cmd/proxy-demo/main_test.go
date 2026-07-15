@@ -272,6 +272,74 @@ func TestResolveProxyMatchesExplicitProxyMetadata(t *testing.T) {
 	}
 }
 
+func TestSelectProxyCandidateRequiresExplicitCountry(t *testing.T) {
+	t.Parallel()
+
+	countries := []vpnclient.Country{
+		{
+			Name: "United States",
+			Code: "US",
+			Cities: []vpnclient.City{{
+				Name:    "United States",
+				Code:    "US",
+				Servers: []vpnclient.Server{{Hostname: "us.example", Port: 443}},
+			}},
+		},
+		{
+			Name: "France",
+			Code: "FR",
+			Cities: []vpnclient.City{{
+				Name:    "France",
+				Code:    "LFPB",
+				Servers: []vpnclient.Server{{Hostname: "fr.example", Port: 443}},
+			}},
+		},
+	}
+
+	_, err := selectProxyCandidate(countries, "")
+	if err == nil || !strings.Contains(err.Error(), "multiple VPN countries") {
+		t.Fatalf("expected explicit-country error, got %v", err)
+	}
+}
+
+func TestSelectProxyCandidateFiltersCountryDeterministically(t *testing.T) {
+	t.Parallel()
+
+	countries := []vpnclient.Country{
+		{
+			Name: "United States",
+			Code: "US",
+			Cities: []vpnclient.City{{
+				Name: "United States",
+				Code: "US",
+				Servers: []vpnclient.Server{
+					{Hostname: "us-primary.example", Port: 443},
+					{Hostname: "us-secondary.example", Port: 443},
+				},
+			}},
+		},
+		{
+			Name: "France",
+			Code: "FR",
+			Cities: []vpnclient.City{{
+				Name:    "France",
+				Code:    "LFPB",
+				Servers: []vpnclient.Server{{Hostname: "fr.example", Port: 443}},
+			}},
+		},
+	}
+
+	for _, filter := range []string{"US", "united states"} {
+		got, err := selectProxyCandidate(countries, filter)
+		if err != nil {
+			t.Fatalf("selectProxyCandidate(%q) returned error: %v", filter, err)
+		}
+		if got.Addr != "us-primary.example:443" {
+			t.Fatalf("expected deterministic first US proxy for %q, got %q", filter, got.Addr)
+		}
+	}
+}
+
 func TestResolveProxyReusesPersistedSelection(t *testing.T) {
 	t.Parallel()
 
@@ -331,6 +399,89 @@ func TestResolveProxyReplacesSelectionMissingFromFreshServerList(t *testing.T) {
 	}
 }
 
+func TestResolveProxyReplacesPersistedSelectionForConfiguredCountry(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "proxy-selection.json")
+	if err := saveProxySelection(path, proxyCandidate{
+		Addr:        "us.example:443",
+		CountryName: "United States",
+		CountryCode: "US",
+	}); err != nil {
+		t.Fatalf("saveProxySelection returned error: %v", err)
+	}
+	countries := []vpnclient.Country{{
+		Name: "France",
+		Code: "FR",
+		Cities: []vpnclient.City{{
+			Name:    "France",
+			Code:    "LFPB",
+			Servers: []vpnclient.Server{{Hostname: "fr.example", Port: 443}},
+		}},
+	}}
+
+	got, fromState, err := resolveProxyWithStateAndCountry("", "FR", countries, path)
+	if err != nil {
+		t.Fatalf("resolveProxyWithStateAndCountry returned error: %v", err)
+	}
+	if fromState {
+		t.Fatal("expected configured country to replace mismatched persisted selection")
+	}
+	if got.Addr != "fr.example:443" || got.CountryCode != "FR" {
+		t.Fatalf("expected French proxy, got %#v", got)
+	}
+}
+
+func TestParseExitProbeResponse(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		body        string
+		wantIP      string
+		wantCountry string
+	}{
+		{
+			name:        "cloudflare trace",
+			body:        "fl=123\nip=203.0.113.8\nloc=jp\ntls=TLSv1.3\n",
+			wantIP:      "203.0.113.8",
+			wantCountry: "JP",
+		},
+		{
+			name:        "json fields",
+			body:        `{"ip":"2001:db8::8","country_code":"DE"}`,
+			wantIP:      "2001:db8::8",
+			wantCountry: "DE",
+		},
+		{
+			name:        "alternate json fields",
+			body:        `{"query":"198.51.100.9","countryCode":"US"}`,
+			wantIP:      "198.51.100.9",
+			wantCountry: "US",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ip, country, err := parseExitProbeResponse([]byte(tt.body))
+			if err != nil {
+				t.Fatalf("parseExitProbeResponse returned error: %v", err)
+			}
+			if ip != tt.wantIP || country != tt.wantCountry {
+				t.Fatalf("expected %s/%s, got %s/%s", tt.wantIP, tt.wantCountry, ip, country)
+			}
+		})
+	}
+}
+
+func TestParseExitProbeResponseRejectsMissingFields(t *testing.T) {
+	t.Parallel()
+
+	if _, _, err := parseExitProbeResponse([]byte("ip=not-an-ip\nloc=USA\n")); err == nil {
+		t.Fatal("expected invalid probe response to be rejected")
+	}
+}
+
 func TestPersistedProxyRequiresThreeStartupFailuresBeforeRemoval(t *testing.T) {
 	t.Parallel()
 
@@ -354,6 +505,60 @@ func TestPersistedProxyRequiresThreeStartupFailuresBeforeRemoval(t *testing.T) {
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected persisted proxy state to be removed, got %v", err)
 	}
+}
+
+type delayedTunnelOpener struct {
+	started chan struct{}
+	release chan struct{}
+	conn    net.Conn
+}
+
+func (d *delayedTunnelOpener) OpenTunnel(string) (net.Conn, error) {
+	close(d.started)
+	<-d.release
+	return d.conn, nil
+}
+
+type closeTrackingConn struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (c *closeTrackingConn) Close() error {
+	c.closed.Store(true)
+	return c.Conn.Close()
+}
+
+func TestOpenTunnelContextClosesConnectionThatArrivesAfterCancellation(t *testing.T) {
+	t.Parallel()
+
+	client, peer := net.Pipe()
+	defer peer.Close()
+	tracked := &closeTrackingConn{Conn: client}
+	opener := &delayedTunnelOpener{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		conn:    tracked,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		conn, err := openTunnelContext(ctx, opener, "example.com:443")
+		resultCh <- result{conn: conn, err: err}
+	}()
+
+	<-opener.started
+	cancel()
+	got := <-resultCh
+	if got.conn != nil || !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("expected canceled dial, got conn=%v err=%v", got.conn, got.err)
+	}
+	close(opener.release)
+	waitForCondition(t, time.Second, tracked.closed.Load)
 }
 
 type fakeTunnelOpener struct {

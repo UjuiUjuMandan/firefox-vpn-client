@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -63,6 +62,9 @@ const (
 	halfCloseDrainTimeout         = 2 * time.Minute
 	maxDistinctOpenTimeoutTargets = 3
 	maxDistinctBadGatewayTargets  = 3
+	defaultExitCheckTimeout       = 10 * time.Second
+	maxExitCheckResponseSize      = 64 * 1024
+	defaultExitCheckURL           = "https://www.cloudflare.com/cdn-cgi/trace"
 )
 
 var (
@@ -143,7 +145,7 @@ func main() {
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
 		fmt.Fprintln(out, "Usage of proxy-demo:")
-		fmt.Fprintln(out, "  proxy-demo [-proxy https://HOST:PORT] [-listen 127.0.0.1:1080] [-h3] [-print-info]")
+		fmt.Fprintln(out, "  proxy-demo [-country CODE | -proxy https://HOST:PORT] [-listen 127.0.0.1:1080] [-h3] [-print-info]")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "This program logs in to Firefox Accounts, fetches a VPN proxy pass, and")
 		fmt.Fprintln(out, "exposes a local SOCKS5 CONNECT proxy over one or more upstream HTTP/2 or HTTP/3 connections.")
@@ -156,7 +158,8 @@ func main() {
 	loginFlag := flag.Bool("login", false, "Force fresh login (ignore saved refresh token)")
 	sessionTokenFlag := flag.String("session-token", "", "Use existing session token directly")
 	printInfoFlag := flag.Bool("print-info", false, "Print user info, quota info, and server list, then exit")
-	proxyFlag := flag.String("proxy", "", "Upstream proxy URL or host:port; random CONNECT server if omitted")
+	proxyFlag := flag.String("proxy", "", "Exact upstream proxy URL or host:port; mutually exclusive with -country")
+	countryFlag := flag.String("country", "", "Mozilla VPN location country code or name used when selecting an upstream proxy")
 	timeoutFlag := flag.Duration("timeout", 20*time.Second, "Upstream dial and handshake timeout")
 	handshakeTimeoutFlag := flag.Duration("handshake-timeout", defaultHandshakeTimeout, "Maximum time allowed for a client SOCKS5 handshake; 0 disables the limit")
 	idleTimeoutFlag := flag.Duration("idle-timeout", defaultIdleTimeout, "Maximum idle time for an established tunnel; 0 disables the limit")
@@ -164,6 +167,9 @@ func main() {
 	upstreamConnsFlag := flag.Int("upstream-conns", defaultUpstreamConnections, "Number of upstream proxy sessions; client IP affinity is used when the value is above 1")
 	statusFileFlag := flag.String("status-file", "", "Write runtime health status JSON to this file; disabled when empty")
 	proxyStateFileFlag := flag.String("proxy-state-file", "", "Persist the automatically selected upstream proxy to this file; disabled when empty")
+	verifyExitFlag := flag.Bool("verify-exit", true, "Verify the actual public exit IP and country with a non-fatal HTTPS data-path probe")
+	exitCheckURLFlag := flag.String("exit-check-url", defaultExitCheckURL, "HTTPS endpoint returning Cloudflare trace or JSON exit IP and country fields")
+	exitCheckTimeoutFlag := flag.Duration("exit-check-timeout", defaultExitCheckTimeout, "Maximum duration of the exit verification probe")
 	useH3Flag := flag.Bool("h3", false, "Use HTTP/3 (QUIC/UDP) instead of HTTP/2 (TCP) for the upstream connection")
 	verboseFlag := flag.Bool("verbose", false, "Enable verbose per-connection logs, including CONNECT target hosts")
 	flag.Parse()
@@ -176,36 +182,56 @@ func main() {
 		logError("invalid -idle-timeout %s: must not be negative", idleTimeoutFlag.String())
 		os.Exit(1)
 	}
+	if *verifyExitFlag && *exitCheckTimeoutFlag <= 0 {
+		logError("invalid -exit-check-timeout %s: must be positive when exit verification is enabled", exitCheckTimeoutFlag.String())
+		os.Exit(1)
+	}
 
 	proxyFlagValue := strings.TrimSpace(*proxyFlag)
+	countryFlagValue := strings.TrimSpace(*countryFlag)
+	if proxyFlagValue != "" && countryFlagValue != "" {
+		logError("-proxy and -country are mutually exclusive")
+		os.Exit(1)
+	}
 	proxyStateFile := strings.TrimSpace(*proxyStateFileFlag)
+	var persistedProxy proxyCandidate
 	hasPersistedProxy := false
 	if proxyFlagValue == "" && proxyStateFile != "" {
-		_, persistedErr := loadProxySelection(proxyStateFile)
+		var persistedErr error
+		persistedProxy, persistedErr = loadProxySelection(proxyStateFile)
 		hasPersistedProxy = persistedErr == nil
 	}
+	needServerList := *printInfoFlag || (proxyFlagValue == "" && (!hasPersistedProxy || !proxyCandidateMatchesCountry(persistedProxy, countryFlagValue)))
 	runtimeAuth, tokenSource, countries := prepareDemoInputs(
 		*loginFlag,
 		strings.TrimSpace(*sessionTokenFlag),
-		*printInfoFlag || (proxyFlagValue == "" && !hasPersistedProxy),
+		needServerList,
 	)
+	var selectedProxy proxyCandidate
+	var selectedFromState bool
+	var selectionSource string
+	var proxyURL *url.URL
+	var err error
+	if !*printInfoFlag {
+		selectedProxy, selectedFromState, err = resolveProxyWithStateAndCountry(proxyFlagValue, countryFlagValue, countries, proxyStateFile)
+		if err != nil {
+			logError("selecting proxy failed: %v", err)
+			os.Exit(1)
+		}
+		selectionSource = "single_available_location"
+		if proxyFlagValue != "" {
+			selectionSource = "configured_proxy"
+		} else if selectedFromState {
+			selectionSource = "persisted"
+		} else if countryFlagValue != "" {
+			selectionSource = "configured_country"
+		}
 
-	selectedProxy, selectedFromState, err := resolveProxyWithState(proxyFlagValue, countries, proxyStateFile)
-	if err != nil {
-		logError("selecting proxy failed: %v", err)
-		os.Exit(1)
-	}
-	selectionSource := "automatic"
-	if proxyFlagValue != "" {
-		selectionSource = "configured"
-	} else if selectedFromState {
-		selectionSource = "persisted"
-	}
-
-	proxyURL, err := normalizeProxyURL(selectedProxy.Addr)
-	if err != nil {
-		logError("invalid proxy %q: %v", selectedProxy.Addr, err)
-		os.Exit(1)
+		proxyURL, err = normalizeProxyURL(selectedProxy.Addr)
+		if err != nil {
+			logError("invalid proxy %q: %v", selectedProxy.Addr, err)
+			os.Exit(1)
+		}
 	}
 
 	pass, err := vpnclient.FetchProxyPass(*guardianFlag, runtimeAuth.Token.AccessToken)
@@ -241,6 +267,7 @@ func main() {
 		printRuntimeInfo(*guardianFlag, runtimeAuth.Token.AccessToken, pass, countries)
 		return
 	}
+
 	sessionStart := time.Now()
 	controller, err := newProxyController(proxyControllerConfig{
 		Guardian:   *guardianFlag,
@@ -273,7 +300,7 @@ func main() {
 		}
 		os.Exit(1)
 	}
-	localToExitLatency := time.Since(sessionStart).Round(time.Millisecond)
+	upstreamSessionEstablishLatency := time.Since(sessionStart).Round(time.Millisecond)
 	if proxyFlagValue == "" && proxyStateFile != "" {
 		if err := saveProxySelection(proxyStateFile, selectedProxy); err != nil {
 			logWarn("saving proxy selection failed path=%s err=%s", proxyStateFile, logErr(err))
@@ -306,15 +333,18 @@ func main() {
 	} else {
 		logInfo("transport=http2 mode=%s renewal=background", upstreamMode(*upstreamConnsFlag))
 	}
-	logInfo("exit selected country=%q country_code=%s city=%q city_code=%s proxy=%s selection_source=%s local_to_exit_latency=%s",
+	logInfo("upstream selected configured_country=%q configured_country_code=%s configured_city=%q configured_city_code=%s proxy=%s selection_source=%s upstream_session_establish_latency=%s",
 		selectedProxy.CountryNameOrUnknown(),
 		selectedProxy.CountryCodeOrUnknown(),
 		selectedProxy.CityNameOrUnknown(),
 		selectedProxy.CityCodeOrUnknown(),
 		selectedProxy.Addr,
 		selectionSource,
-		localToExitLatency,
+		upstreamSessionEstablishLatency,
 	)
+	if *verifyExitFlag {
+		go logVerifiedExit(controller, strings.TrimSpace(*exitCheckURLFlag), *exitCheckTimeoutFlag, selectedProxy.CountryCode)
+	}
 
 	server := newSocksServer(controller, *handshakeTimeoutFlag, *idleTimeoutFlag, *maxConnsFlag)
 
@@ -337,6 +367,171 @@ func main() {
 		acceptRetryDelay = 0
 		go server.handleConn(conn)
 	}
+}
+
+type exitProbeResult struct {
+	IP          string
+	CountryCode string
+	Latency     time.Duration
+	ProbeHost   string
+}
+
+func logVerifiedExit(opener tunnelOpener, rawURL string, timeout time.Duration, configuredCountryCode string) {
+	result, err := verifyExit(opener, rawURL, timeout)
+	if err != nil {
+		logWarn("exit verification failed probe_host=%s timeout=%s err=%s", exitProbeHost(rawURL), timeout, logErr(err))
+		return
+	}
+	logInfo("exit verified ip=%s country_code=%s data_path_probe_latency=%s probe_host=%s",
+		result.IP,
+		result.CountryCode,
+		result.Latency.Round(time.Millisecond),
+		result.ProbeHost,
+	)
+	if configuredCountryCode != "" && !strings.EqualFold(configuredCountryCode, result.CountryCode) {
+		logWarn("verified exit country differs from configured upstream location configured_country_code=%s verified_country_code=%s",
+			configuredCountryCode,
+			result.CountryCode,
+		)
+	}
+}
+
+func exitProbeHost(rawURL string) string {
+	probeURL, err := url.Parse(rawURL)
+	if err != nil || probeURL.Hostname() == "" {
+		return "<invalid>"
+	}
+	return probeURL.Hostname()
+}
+
+func verifyExit(opener tunnelOpener, rawURL string, timeout time.Duration) (exitProbeResult, error) {
+	if opener == nil {
+		return exitProbeResult{}, fmt.Errorf("nil tunnel opener")
+	}
+	probeURL, err := url.Parse(rawURL)
+	if err != nil {
+		return exitProbeResult{}, fmt.Errorf("parsing exit check URL: %w", err)
+	}
+	if !strings.EqualFold(probeURL.Scheme, "https") || probeURL.Hostname() == "" {
+		return exitProbeResult{}, fmt.Errorf("exit check URL must use HTTPS and include a host")
+	}
+
+	transport := &http.Transport{
+		Proxy:               nil,
+		DisableKeepAlives:   true,
+		TLSHandshakeTimeout: timeout,
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+		DialContext: func(ctx context.Context, _, authority string) (net.Conn, error) {
+			return openTunnelContext(ctx, opener, authority)
+		},
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: timeout}
+
+	request, err := http.NewRequest(http.MethodGet, probeURL.String(), nil)
+	if err != nil {
+		return exitProbeResult{}, fmt.Errorf("creating exit verification request: %w", err)
+	}
+	request.Header.Set("Accept", "text/plain, application/json")
+	request.Header.Set("User-Agent", "firefox-vpn-client-exit-check/1")
+
+	started := time.Now()
+	response, err := client.Do(request)
+	if err != nil {
+		return exitProbeResult{}, fmt.Errorf("requesting exit verification endpoint: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return exitProbeResult{}, fmt.Errorf("exit verification endpoint returned HTTP %d", response.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxExitCheckResponseSize+1))
+	if err != nil {
+		return exitProbeResult{}, fmt.Errorf("reading exit verification response: %w", err)
+	}
+	if len(body) > maxExitCheckResponseSize {
+		return exitProbeResult{}, fmt.Errorf("exit verification response exceeds %d bytes", maxExitCheckResponseSize)
+	}
+	ip, countryCode, err := parseExitProbeResponse(body)
+	if err != nil {
+		return exitProbeResult{}, err
+	}
+	return exitProbeResult{
+		IP:          ip,
+		CountryCode: countryCode,
+		Latency:     time.Since(started),
+		ProbeHost:   probeURL.Hostname(),
+	}, nil
+}
+
+func openTunnelContext(ctx context.Context, opener tunnelOpener, authority string) (net.Conn, error) {
+	type tunnelResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan tunnelResult)
+	go func() {
+		conn, err := opener.OpenTunnel(authority)
+		select {
+		case resultCh <- tunnelResult{conn: conn, err: err}:
+		case <-ctx.Done():
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}
+	}()
+
+	select {
+	case result := <-resultCh:
+		return result.conn, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func parseExitProbeResponse(body []byte) (string, string, error) {
+	fields := make(map[string]string)
+	for _, line := range strings.Split(string(body), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if ok {
+			fields[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
+		}
+	}
+
+	ip := firstNonEmpty(fields["ip"], fields["query"])
+	countryCode := firstNonEmpty(fields["loc"], fields["country_code"], fields["countrycode"])
+	if ip == "" || countryCode == "" {
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err == nil {
+			ip = firstNonEmpty(ip, jsonString(payload, "ip"), jsonString(payload, "query"))
+			countryCode = firstNonEmpty(countryCode, jsonString(payload, "country_code"), jsonString(payload, "countryCode"))
+		}
+	}
+
+	ip = strings.TrimSpace(ip)
+	if net.ParseIP(ip) == nil {
+		return "", "", fmt.Errorf("exit verification response did not contain a valid IP address")
+	}
+	countryCode = strings.ToUpper(strings.TrimSpace(countryCode))
+	if len(countryCode) != 2 || countryCode[0] < 'A' || countryCode[0] > 'Z' || countryCode[1] < 'A' || countryCode[1] > 'Z' {
+		return "", "", fmt.Errorf("exit verification response did not contain a valid two-letter country code")
+	}
+	return ip, countryCode, nil
+}
+
+func jsonString(payload map[string]any, key string) string {
+	value, _ := payload[key].(string)
+	return value
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func guardianStatusCode(err error) int {
@@ -565,11 +760,15 @@ func (p proxyCandidate) CityCodeOrUnknown() string {
 }
 
 func resolveProxy(proxyFlag string, countries []vpnclient.Country) (proxyCandidate, error) {
-	candidate, _, err := resolveProxyWithState(proxyFlag, countries, "")
+	candidate, _, err := resolveProxyWithStateAndCountry(proxyFlag, "", countries, "")
 	return candidate, err
 }
 
 func resolveProxyWithState(proxyFlag string, countries []vpnclient.Country, stateFile string) (proxyCandidate, bool, error) {
+	return resolveProxyWithStateAndCountry(proxyFlag, "", countries, stateFile)
+}
+
+func resolveProxyWithStateAndCountry(proxyFlag, countryFilter string, countries []vpnclient.Country, stateFile string) (proxyCandidate, bool, error) {
 	if proxyFlag != "" {
 		if matched, ok := findProxyCandidate(proxyFlag, countries); ok {
 			matched.Addr = proxyFlag
@@ -581,24 +780,94 @@ func resolveProxyWithState(proxyFlag string, countries []vpnclient.Country, stat
 	if stateFile != "" {
 		persisted, err := loadProxySelection(stateFile)
 		if err == nil {
-			if matched, ok := findProxyCandidate(persisted.Addr, countries); ok {
-				matched.Addr = persisted.Addr
-				return matched, true, nil
+			if proxyCandidateMatchesCountry(persisted, countryFilter) {
+				if matched, ok := findProxyCandidate(persisted.Addr, countries); ok {
+					matched.Addr = persisted.Addr
+					return matched, true, nil
+				}
+				if len(countries) == 0 {
+					return persisted, true, nil
+				}
+				logWarn("persisted proxy is no longer present in server list; selecting a replacement proxy=%s", persisted.Addr)
+			} else if countryFilter != "" {
+				logInfo("persisted proxy does not match configured country; selecting a replacement proxy=%s persisted_country_code=%s configured_country=%q",
+					persisted.Addr,
+					persisted.CountryCodeOrUnknown(),
+					countryFilter,
+				)
 			}
-			if len(countries) == 0 {
-				return persisted, true, nil
-			}
-			logWarn("persisted proxy is no longer present in server list; selecting a replacement proxy=%s", persisted.Addr)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			logWarn("loading persisted proxy selection failed path=%s err=%s", stateFile, logErr(err))
 		}
 	}
 
+	candidate, err := selectProxyCandidate(countries, countryFilter)
+	if err != nil {
+		return proxyCandidate{}, false, err
+	}
+	return candidate, false, nil
+}
+
+func selectProxyCandidate(countries []vpnclient.Country, countryFilter string) (proxyCandidate, error) {
 	proxies := connectProxyCandidates(countries)
 	if len(proxies) == 0 {
-		return proxyCandidate{}, false, fmt.Errorf("no CONNECT proxies available from server list or persisted state; pass -proxy explicitly")
+		return proxyCandidate{}, fmt.Errorf("no CONNECT proxies available from server list or persisted state; pass -country CODE or -proxy HOST:PORT")
 	}
-	return proxies[rand.IntN(len(proxies))], false, nil
+
+	countryFilter = strings.TrimSpace(countryFilter)
+	if countryFilter != "" {
+		for _, candidate := range proxies {
+			if proxyCandidateMatchesCountry(candidate, countryFilter) {
+				return candidate, nil
+			}
+		}
+		return proxyCandidate{}, fmt.Errorf("no CONNECT proxy found for country %q; available country codes: %s", countryFilter, availableCountryCodes(proxies))
+	}
+
+	selectedCountryCode := ""
+	for _, candidate := range proxies {
+		code := strings.ToUpper(strings.TrimSpace(candidate.CountryCode))
+		if code == "" {
+			continue
+		}
+		if selectedCountryCode == "" {
+			selectedCountryCode = code
+			continue
+		}
+		if code != selectedCountryCode {
+			return proxyCandidate{}, fmt.Errorf("multiple VPN countries are available; pass -country CODE or -proxy HOST:PORT instead of selecting a random country (available: %s)", availableCountryCodes(proxies))
+		}
+	}
+	return proxies[0], nil
+}
+
+func proxyCandidateMatchesCountry(candidate proxyCandidate, countryFilter string) bool {
+	countryFilter = strings.TrimSpace(countryFilter)
+	if countryFilter == "" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(candidate.CountryCode), countryFilter) ||
+		strings.EqualFold(strings.TrimSpace(candidate.CountryName), countryFilter)
+}
+
+func availableCountryCodes(candidates []proxyCandidate) string {
+	seen := make(map[string]struct{})
+	codes := make([]string, 0)
+	for _, candidate := range candidates {
+		code := strings.ToUpper(strings.TrimSpace(candidate.CountryCode))
+		if code == "" {
+			continue
+		}
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		codes = append(codes, code)
+	}
+	if len(codes) == 0 {
+		return "unknown"
+	}
+	return strings.Join(codes, ",")
 }
 
 func loadProxySelection(path string) (proxyCandidate, error) {
