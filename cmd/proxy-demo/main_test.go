@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -32,6 +33,32 @@ func TestNormalizeProxyURLAddsHTTPS(t *testing.T) {
 	}
 	if got.Host != "proxy.example.test:443" {
 		t.Fatalf("expected host proxy.example.test:443, got %q", got.Host)
+	}
+}
+
+func TestObtainOAuthTokenUsesValidCachedAccessToken(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	want := &vpnclient.TokenResponse{
+		AccessToken:  "cached-access-token",
+		RefreshToken: "refresh-token",
+		ExpiresIn:    3600,
+		Scope:        "profile",
+	}
+	if err := vpnclient.SaveTokens(want); err != nil {
+		t.Fatalf("SaveTokens returned error: %v", err)
+	}
+
+	got, source, obtainedAt := obtainOAuthToken(false)
+	if source != "cached access token" {
+		t.Fatalf("expected cached access token source, got %q", source)
+	}
+	if got.AccessToken != want.AccessToken || got.RefreshToken != want.RefreshToken {
+		t.Fatalf("expected cached token %#v, got %#v", want, got)
+	}
+	if time.Since(obtainedAt) > time.Minute {
+		t.Fatalf("expected cached obtained time to be preserved, got %s", obtainedAt)
 	}
 }
 
@@ -245,6 +272,90 @@ func TestResolveProxyMatchesExplicitProxyMetadata(t *testing.T) {
 	}
 }
 
+func TestResolveProxyReusesPersistedSelection(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "proxy-selection.json")
+	want := proxyCandidate{
+		Addr:        "stable.example:443",
+		CountryName: "United States",
+		CountryCode: "US",
+		CityName:    "San Jose",
+		CityCode:    "SJC",
+	}
+	if err := saveProxySelection(path, want); err != nil {
+		t.Fatalf("saveProxySelection returned error: %v", err)
+	}
+
+	got, fromState, err := resolveProxyWithState("", nil, path)
+	if err != nil {
+		t.Fatalf("resolveProxyWithState returned error: %v", err)
+	}
+	if !fromState {
+		t.Fatal("expected persisted proxy selection to be reused")
+	}
+	if got != want {
+		t.Fatalf("expected %#v, got %#v", want, got)
+	}
+}
+
+func TestResolveProxyReplacesSelectionMissingFromFreshServerList(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "proxy-selection.json")
+	if err := saveProxySelection(path, proxyCandidate{Addr: "stale.example:443"}); err != nil {
+		t.Fatalf("saveProxySelection returned error: %v", err)
+	}
+	countries := []vpnclient.Country{{
+		Name: "Japan",
+		Code: "JP",
+		Cities: []vpnclient.City{{
+			Name: "Tokyo",
+			Code: "TYO",
+			Servers: []vpnclient.Server{{
+				Hostname: "current.example",
+				Port:     443,
+			}},
+		}},
+	}}
+
+	got, fromState, err := resolveProxyWithState("", countries, path)
+	if err != nil {
+		t.Fatalf("resolveProxyWithState returned error: %v", err)
+	}
+	if fromState {
+		t.Fatal("expected stale persisted selection to be replaced")
+	}
+	if got.Addr != "current.example:443" {
+		t.Fatalf("expected current server-list proxy, got %q", got.Addr)
+	}
+}
+
+func TestPersistedProxyRequiresThreeStartupFailuresBeforeRemoval(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "proxy-selection.json")
+	candidate := proxyCandidate{Addr: "stable.example:443"}
+	if err := saveProxySelection(path, candidate); err != nil {
+		t.Fatalf("saveProxySelection returned error: %v", err)
+	}
+	for want := 1; want <= 3; want++ {
+		failures, cleared, err := recordProxySelectionFailure(path, candidate)
+		if err != nil {
+			t.Fatalf("recordProxySelectionFailure %d returned error: %v", want, err)
+		}
+		if failures != want {
+			t.Fatalf("expected %d failures, got %d", want, failures)
+		}
+		if cleared != (want == 3) {
+			t.Fatalf("unexpected cleared=%v after %d failures", cleared, want)
+		}
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected persisted proxy state to be removed, got %v", err)
+	}
+}
+
 type fakeTunnelOpener struct {
 	active atomic.Int32
 	max    atomic.Int32
@@ -378,9 +489,13 @@ func TestSocksServerHandshakeTimeout(t *testing.T) {
 }
 
 type fakeProxySession struct {
-	openCount  atomic.Int32
-	closeCount atomic.Int32
-	openErr    error
+	openCount   atomic.Int32
+	closeCount  atomic.Int32
+	updateCount atomic.Int32
+	openErr     error
+	updateErr   error
+	tokenMu     sync.Mutex
+	token       string
 }
 
 func (s *fakeProxySession) OpenTunnel(authority string) (net.Conn, error) {
@@ -396,6 +511,23 @@ func (s *fakeProxySession) Close() error {
 	return nil
 }
 
+func (s *fakeProxySession) UpdateToken(token string) error {
+	s.updateCount.Add(1)
+	if s.updateErr != nil {
+		return s.updateErr
+	}
+	s.tokenMu.Lock()
+	s.token = token
+	s.tokenMu.Unlock()
+	return nil
+}
+
+func (s *fakeProxySession) currentToken() string {
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+	return s.token
+}
+
 type fakeNetConn struct{}
 
 func (c *fakeNetConn) Read(p []byte) (int, error)       { return 0, io.EOF }
@@ -406,6 +538,58 @@ func (c *fakeNetConn) RemoteAddr() net.Addr             { return tunnelAddr("fak
 func (c *fakeNetConn) SetDeadline(time.Time) error      { return nil }
 func (c *fakeNetConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *fakeNetConn) SetWriteDeadline(time.Time) error { return nil }
+
+type controlledNetConn struct {
+	readErr error
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func newControlledNetConn(readErr error) *controlledNetConn {
+	return &controlledNetConn{readErr: readErr, closed: make(chan struct{})}
+}
+
+func (c *controlledNetConn) Read([]byte) (int, error) {
+	if c.readErr != nil {
+		return 0, c.readErr
+	}
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *controlledNetConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *controlledNetConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+func (c *controlledNetConn) LocalAddr() net.Addr              { return tunnelAddr("controlled") }
+func (c *controlledNetConn) RemoteAddr() net.Addr             { return tunnelAddr("controlled") }
+func (c *controlledNetConn) SetDeadline(time.Time) error      { return nil }
+func (c *controlledNetConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *controlledNetConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestProxyBidirectionalClosesBothSidesOnCopyError(t *testing.T) {
+	t.Parallel()
+
+	client := newControlledNetConn(errors.New("client read failed"))
+	upstream := newControlledNetConn(nil)
+	done := make(chan struct{})
+	go func() {
+		proxyBidirectional(client, upstream, 0)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("proxyBidirectional did not close the blocked peer after copy error")
+	}
+	select {
+	case <-upstream.closed:
+	default:
+		t.Fatal("expected upstream connection to be closed")
+	}
+}
 
 type fakeHalfCloseConn struct {
 	fakeNetConn
@@ -530,6 +714,192 @@ func TestProxySessionPoolDistributesTunnels(t *testing.T) {
 	}
 }
 
+func TestProxySessionPoolPinsClientToOneSession(t *testing.T) {
+	t.Parallel()
+
+	sessions := []*fakeProxySession{{}, {}, {}}
+	var created atomic.Int32
+	p, err := newProxySessionPool(len(sessions), func() (proxySession, error) {
+		idx := int(created.Add(1)) - 1
+		if idx >= len(sessions) {
+			return nil, errors.New("replacement unavailable")
+		}
+		return sessions[idx], nil
+	})
+	if err != nil {
+		t.Fatalf("newProxySessionPool returned error: %v", err)
+	}
+	defer p.Close()
+
+	for i := 0; i < 6; i++ {
+		conn, err := p.OpenTunnelForClient("example.com:443", "127.0.0.1")
+		if err != nil {
+			t.Fatalf("OpenTunnelForClient %d returned error: %v", i, err)
+		}
+		_ = conn.Close()
+	}
+
+	used := 0
+	for i, session := range sessions {
+		if got := session.openCount.Load(); got > 0 {
+			used++
+			if got != 6 {
+				t.Fatalf("expected pinned session %d to receive all tunnels, got %d", i, got)
+			}
+		}
+	}
+	if used != 1 {
+		t.Fatalf("expected one session to receive pinned client tunnels, used %d", used)
+	}
+}
+
+func TestProxySessionPoolKeepsClientOnFailoverSession(t *testing.T) {
+	t.Parallel()
+
+	sessions := []*fakeProxySession{{}, {}, {}}
+	var created atomic.Int32
+	p, err := newProxySessionPool(len(sessions), func() (proxySession, error) {
+		idx := int(created.Add(1)) - 1
+		if idx >= len(sessions) {
+			return nil, errors.New("replacement unavailable")
+		}
+		return sessions[idx], nil
+	})
+	if err != nil {
+		t.Fatalf("newProxySessionPool returned error: %v", err)
+	}
+	defer p.Close()
+
+	const clientKey = "127.0.0.1"
+	failedSlot := p.nextSlot(clientKey)
+	failoverSlot := (failedSlot + 1) % len(sessions)
+	sessions[failedSlot].openErr = errors.New("transport closed")
+
+	conn, err := p.OpenTunnelForClient("example.com:443", clientKey)
+	if err != nil {
+		t.Fatalf("OpenTunnelForClient failover returned error: %v", err)
+	}
+	_ = conn.Close()
+
+	conn, err = p.OpenTunnelForClient("example.org:443", clientKey)
+	if err != nil {
+		t.Fatalf("OpenTunnelForClient after failover returned error: %v", err)
+	}
+	_ = conn.Close()
+
+	if got := sessions[failedSlot].openCount.Load(); got != 1 {
+		t.Fatalf("expected failed slot to be tried once, got %d", got)
+	}
+	if got := sessions[failoverSlot].openCount.Load(); got != 2 {
+		t.Fatalf("expected failover slot to remain sticky, got %d opens", got)
+	}
+}
+
+func TestProxySessionPoolUpdatesExistingAndReplacementTokens(t *testing.T) {
+	t.Parallel()
+
+	var factoryMu sync.Mutex
+	createToken := "old-token"
+	var sessions []*fakeProxySession
+	p, err := newProxySessionPool(2, func() (proxySession, error) {
+		factoryMu.Lock()
+		defer factoryMu.Unlock()
+		session := &fakeProxySession{token: createToken}
+		sessions = append(sessions, session)
+		return session, nil
+	}, func(token string) {
+		factoryMu.Lock()
+		createToken = token
+		factoryMu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("newProxySessionPool returned error: %v", err)
+	}
+	defer p.Close()
+
+	if err := p.UpdateToken("new-token"); err != nil {
+		t.Fatalf("UpdateToken returned error: %v", err)
+	}
+	factoryMu.Lock()
+	initial := append([]*fakeProxySession(nil), sessions...)
+	factoryMu.Unlock()
+	for i, session := range initial {
+		if got := session.currentToken(); got != "new-token" {
+			t.Fatalf("expected existing session %d token to update, got %q", i, got)
+		}
+	}
+
+	failed := p.slot(0)
+	p.retireSlot(0, failed)
+	waitForCondition(t, time.Second, func() bool {
+		factoryMu.Lock()
+		defer factoryMu.Unlock()
+		return len(sessions) >= 3
+	})
+	factoryMu.Lock()
+	replacement := sessions[len(sessions)-1]
+	factoryMu.Unlock()
+	if got := replacement.currentToken(); got != "new-token" {
+		t.Fatalf("expected replacement session to use renewed token, got %q", got)
+	}
+}
+
+func TestProxySessionPoolUpdatesReplacementCreatedDuringRenewal(t *testing.T) {
+	t.Parallel()
+
+	var factoryMu sync.Mutex
+	createToken := "old-token"
+	createCalls := 0
+	replacementStarted := make(chan struct{})
+	releaseReplacement := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseReplacement) })
+	var sessions []*fakeProxySession
+	p, err := newProxySessionPool(2, func() (proxySession, error) {
+		factoryMu.Lock()
+		createCalls++
+		call := createCalls
+		token := createToken
+		factoryMu.Unlock()
+		if call == 3 {
+			close(replacementStarted)
+			<-releaseReplacement
+		}
+		session := &fakeProxySession{token: token}
+		factoryMu.Lock()
+		sessions = append(sessions, session)
+		factoryMu.Unlock()
+		return session, nil
+	}, func(token string) {
+		factoryMu.Lock()
+		createToken = token
+		factoryMu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("newProxySessionPool returned error: %v", err)
+	}
+	defer p.Close()
+
+	p.retireSlot(0, p.slot(0))
+	select {
+	case <-replacementStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement session creation did not start")
+	}
+	if err := p.UpdateToken("new-token"); err != nil {
+		t.Fatalf("UpdateToken returned error: %v", err)
+	}
+	releaseOnce.Do(func() { close(releaseReplacement) })
+	waitForCondition(t, time.Second, func() bool { return p.slot(0) != nil })
+
+	factoryMu.Lock()
+	replacement := sessions[len(sessions)-1]
+	factoryMu.Unlock()
+	if got := replacement.currentToken(); got != "new-token" {
+		t.Fatalf("expected in-flight replacement to receive renewed token, got %q", got)
+	}
+}
+
 func TestProxySessionPoolSkipsBrokenSession(t *testing.T) {
 	t.Parallel()
 
@@ -618,7 +988,7 @@ func TestProxySessionPoolReplenishesBrokenSession(t *testing.T) {
 	_ = conn.Close()
 
 	waitForCondition(t, time.Second, func() bool {
-		return created.Load() >= 3
+		return pool.slot(0) != nil
 	})
 
 	for i := 0; i < 2; i++ {
@@ -709,6 +1079,26 @@ func TestTunnelConnDeadlineUnsupported(t *testing.T) {
 	}
 }
 
+func TestProxySessionsUpdateBearerToken(t *testing.T) {
+	t.Parallel()
+
+	h2Session := &h2ProxySession{token: "old-token"}
+	if err := h2Session.UpdateToken("new-token"); err != nil {
+		t.Fatalf("h2 UpdateToken returned error: %v", err)
+	}
+	if got := h2Session.bearerToken(); got != "new-token" {
+		t.Fatalf("expected h2 token update, got %q", got)
+	}
+
+	h3Session := &h3ProxySession{token: "old-token"}
+	if err := h3Session.UpdateToken("new-token"); err != nil {
+		t.Fatalf("h3 UpdateToken returned error: %v", err)
+	}
+	if got := h3Session.bearerToken(); got != "new-token" {
+		t.Fatalf("expected h3 token update, got %q", got)
+	}
+}
+
 func TestRoundTripWithOpenTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -736,6 +1126,36 @@ func TestShouldRebuildProxySession(t *testing.T) {
 	}
 	if !shouldRebuildProxySession(errors.New("transport closed")) {
 		t.Fatal("expected transport errors to rebuild session")
+	}
+}
+
+func TestSessionFailureTrackerRequiresDistinctTargets(t *testing.T) {
+	t.Parallel()
+
+	tracker := &sessionFailureTracker{}
+	timeoutErr := &tunnelOpenTimeoutError{timeout: time.Second}
+	for i := 0; i < 5; i++ {
+		if err := tracker.observe("same.example:443", timeoutErr); errors.Is(err, errProxySessionUnhealthy) {
+			t.Fatal("repeated failure for one target should not retire the session")
+		}
+	}
+	if err := tracker.observe("second.example:443", timeoutErr); errors.Is(err, errProxySessionUnhealthy) {
+		t.Fatal("two failed targets should not retire the session")
+	}
+	if err := tracker.observe("third.example:443", timeoutErr); !errors.Is(err, errProxySessionUnhealthy) {
+		t.Fatalf("expected three distinct timeout targets to retire the session, got %v", err)
+	}
+
+	tracker.observe("healthy.example:443", nil)
+	badGateway := &proxyConnectHTTPError{statusCode: http.StatusBadGateway, status: "502 Bad Gateway"}
+	if err := tracker.observe("one.example:443", badGateway); errors.Is(err, errProxySessionUnhealthy) {
+		t.Fatal("one 502 target should not retire the session")
+	}
+	if err := tracker.observe("two.example:443", badGateway); errors.Is(err, errProxySessionUnhealthy) {
+		t.Fatal("two 502 targets should not retire the session")
+	}
+	if err := tracker.observe("three.example:443", badGateway); !errors.Is(err, errProxySessionUnhealthy) {
+		t.Fatalf("expected three distinct 502 targets to retire the session, got %v", err)
 	}
 }
 
@@ -802,6 +1222,50 @@ func TestProxyControllerSwapDrainsOldSession(t *testing.T) {
 	_ = conn1.Close()
 	if oldSession.closeCount.Load() != 1 {
 		t.Fatalf("expected old session to close after draining, got %d", oldSession.closeCount.Load())
+	}
+}
+
+func TestProxyControllerUpdatesTokenWithoutReplacingSession(t *testing.T) {
+	t.Parallel()
+
+	session := &fakeProxySession{token: "old-token"}
+	oldExpiry := time.Now().Add(10 * time.Minute)
+	newExpiry := time.Now().Add(20 * time.Minute)
+	controller := &proxyController{
+		current: &managedSession{
+			session:   session,
+			expiresAt: oldExpiry,
+			accepting: true,
+		},
+	}
+
+	if err := controller.updateCurrentSessionToken("new-token", newExpiry); err != nil {
+		t.Fatalf("updateCurrentSessionToken returned error: %v", err)
+	}
+	if controller.current.session != session {
+		t.Fatal("expected token renewal to retain the existing upstream session")
+	}
+	if got := session.currentToken(); got != "new-token" {
+		t.Fatalf("expected renewed token, got %q", got)
+	}
+	if !controller.current.expiresAt.Equal(newExpiry) {
+		t.Fatalf("expected expiry %s, got %s", newExpiry, controller.current.expiresAt)
+	}
+	if session.closeCount.Load() != 0 {
+		t.Fatalf("expected retained session to stay open, got %d closes", session.closeCount.Load())
+	}
+}
+
+func TestProxyControllerRejectsSessionSwapAfterClose(t *testing.T) {
+	t.Parallel()
+
+	controller := &proxyController{closed: true}
+	newSession := &fakeProxySession{}
+	if controller.swapSession(newSession, time.Now().Add(time.Minute)) {
+		t.Fatal("expected closed controller to reject session swap")
+	}
+	if got := newSession.closeCount.Load(); got != 1 {
+		t.Fatalf("expected rejected session to be closed once, got %d", got)
 	}
 }
 

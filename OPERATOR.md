@@ -7,7 +7,7 @@
 - 登录 Firefox Account，获取 OAuth token 和 Guardian proxy pass。
 - 本地暴露 SOCKS5 CONNECT 代理。
 - 上游使用 HTTP/2 或 HTTP/3 CONNECT session；高并发时可开启上游 session 池。
-- proxy pass 后台续期；OpenTunnel 失败时会重建上游 session 并重试。
+- proxy pass 后台续期时优先原地更新 session token，避免周期性更换出口；session 确认损坏时才重建并重试。
 - Linux 可通过 systemd 常驻运行，附带健康检查和自动重启。
 
 ## 手动运行
@@ -27,13 +27,14 @@ go run ./cmd/proxy-demo -listen 127.0.0.1:1088
 常用参数：
 
 ```bash
--proxy HOST:PORT              # 指定出口 proxy，不指定则随机选择 CONNECT 服务器
+-proxy HOST:PORT              # 指定出口 proxy；systemd 未指定时会持久化首次成功选择
+-proxy-state-file PATH        # 保存自动选择的 proxy，重启后优先复用
 -h3                           # 使用 HTTP/3/QUIC
 -timeout 20s                  # 上游拨号、握手、CONNECT 打开阶段超时
 -handshake-timeout 10s        # 客户端 SOCKS5 握手超时
 -idle-timeout 0               # 已建立隧道的空闲超时，0 表示关闭限制
 -max-conns 256                # 最大并发客户端连接数，0 表示关闭限制
--upstream-conns 1             # 上游 proxy session 数量，提高并发吞吐时可设为 2-4
+-upstream-conns 1             # 上游 proxy session 数量；单用户/sing-box 建议保持 1
 -status-file PATH             # 写入运行状态，systemd 健康检查用来判断 proxy pass 是否过期
 -verbose                      # 打印完整 CONNECT 目标，默认会打码
 ```
@@ -64,7 +65,7 @@ Fastly 内部静默跳点
 
 - 不要只看 `mtr` 中间跳；Fastly 内部跳点可能静默，ICMP 也不等同于 CONNECT/MASQUE 实际路径。
 - 以程序日志里的 `local_to_exit_latency`、经 SOCKS 访问目标站的 RTT、下载速度作为主要判断依据。
-- `PROXY=` 为空时会随机选择 CONNECT server，可能选到跨洲或内部绕路严重的节点。
+- `PROXY=` 为空时首次启动会随机选择 CONNECT server；systemd 会保存到 `PROXY_STATE_FILE`，后续重启优先复用同一节点。持久化节点连续 3 次启动失败后才会清除并重新选择，避免一次临时丢包触发出口漂移。
 - 需要稳定出口时，优先固定一个实测延迟低的 `PROXY=HOST:PORT`。
 - 如果同一国家的多个节点全部高延迟，通常是 Fastly 对当前 VPS 线路的内部调度问题，客户端侧很难强制它落到本地 gateway。
 
@@ -113,6 +114,7 @@ sudo systemctl restart firefox-vpn-client.service
 ```bash
 LISTEN=127.0.0.1:1088
 PROXY=
+PROXY_STATE_FILE=/var/lib/firefox-vpn-client/proxy-selection.json
 TIMEOUT=20s
 HANDSHAKE_TIMEOUT=10s
 IDLE_TIMEOUT=0
@@ -125,6 +127,8 @@ HEALTH_TIMEOUT=5
 HEALTH_VERBOSE=0
 HEALTH_TARGET=
 HEALTH_TARGETS=www.google.com:443,example.com:443
+HEALTH_FAILURE_THRESHOLD=3
+HEALTH_FAILURE_STATE=/var/lib/firefox-vpn-client/health-failures
 HEALTH_STATUS_GRACE=30
 STATUS_FILE=/var/lib/firefox-vpn-client/status.json
 EXTRA_ARGS=
@@ -136,18 +140,27 @@ EXTRA_ARGS=
 
 ```bash
 MAX_CONNS=1024
-UPSTREAM_CONNS=4
+UPSTREAM_CONNS=1
 IDLE_TIMEOUT=5m
 VERBOSE=0
 ```
 
 调优建议：
 
-- `UPSTREAM_CONNS` 会建立多条到同一 Fastly proxy 的 HTTP/2/HTTP/3 上游 session。多连接下载、多客户端并发时通常比单 session 更稳。
+- `UPSTREAM_CONNS` 大于 1 时，SOCKS5 服务会按客户端 IP 把连接粘滞到一个上游 session，同一客户端不会逐请求轮询出口；session 失败时才切换到其他 session。
+- 对单个 sing-box 或单个浏览器，多个上游 session 不会叠加带宽，而且 Fastly 仍可能在出口侧改变地址族或出口 IP，因此默认建议 `UPSTREAM_CONNS=1`。只有多个独立客户端 IP 共享服务，或确实需要故障冗余时，才考虑设为 2-4。
 - `MAX_CONNS` 需要小于系统文件句柄上限；systemd unit 默认设置 `LimitNOFILE=65535`。
 - `IDLE_TIMEOUT=5m` 会清理长时间无流量的已建立隧道，避免客户端或 sing-box 遗留连接占满并发槽；默认 `0` 更适合 SSH、WebSocket 等长连接。
 - `VERBOSE=1` 会增加日志 IO 和锁竞争，只建议临时排障开启。
-- 性能差时优先固定实测低延迟的 `PROXY=`，随机节点可能选到 Fastly 内部绕路严重的出口。
+- 性能差时优先固定实测低延迟的 `PROXY=`；未固定时会复用 `PROXY_STATE_FILE` 中上次成功的自动选择。
+
+## 稳定性策略
+
+- proxy pass 正常续期只更新现有 H2/H3 session 的 bearer token，不会周期性重建连接池；只有 session 已过期、认证失败或确认损坏时才换 session。
+- H2 空闲 30 秒会发送 PING，15 秒未收到响应会关闭半开连接。
+- 同一个目标反复 502/超时不会触发换出口；同一 session 上至少 3 个不同目标连续失败才判定为 session 级故障。
+- 双向转发发生异常错误时会立即关闭两端；正常半关闭最多排空 2 分钟，防止连接和 `MAX_CONNS` 槽位永久泄漏。
+- systemd 自动选点会持久化；节点连续 3 次启动失败后才重新选择。
 
 ## 升级
 
@@ -174,11 +187,12 @@ timer 默认每 30 秒运行一次。
 1. 确认 `firefox-vpn-client.service` 处于 active。
 2. 如果有 `python3`，读取 `STATUS_FILE`，确认当前 proxy pass 没有超过 `proxy_pass_expires_at + HEALTH_STATUS_GRACE`。
 3. 连接 `LISTEN` 地址。
-4. 如果有 `python3`，执行 SOCKS5 greeting，并通过代理 CONNECT 到 `HEALTH_TARGETS` 里的每个目标。
+4. 如果有 `python3`，执行 SOCKS5 greeting，并通过代理 CONNECT 到 `HEALTH_TARGETS` 里的每个目标；443 域名还会完成 TLS 握手和轻量 HTTP 数据探测。
 5. 没有 `python3` 时退化为本地 TCP 端口检查，不验证 proxy pass 过期和上游出口。
-6. 失败则执行 `systemctl restart firefox-vpn-client.service`。
+6. 单个目标失败只记录告警；所有目标连续失败 `HEALTH_FAILURE_THRESHOLD` 次才重启服务。
+7. 重启前会清除 systemd start-limit 计数，避免控制面临时故障后服务长期停留在 failed 状态。
 
-`HEALTH_TARGET` 是旧的单目标配置；如果设置了 `HEALTH_TARGETS`，优先使用 `HEALTH_TARGETS`。不要把经常间歇性 502 的目标放进健康检查，否则会触发不必要的重启。
+`HEALTH_TARGET` 是旧的单目标配置；如果设置了 `HEALTH_TARGETS`，优先使用 `HEALTH_TARGETS`。建议保留至少两个相互独立的稳定目标，避免把单站点故障误判成整个代理失效。
 
 如果主服务处于 `inactive`，健康检查会认为它是被手动停止的，不会通过 timer 重新拉起。
 

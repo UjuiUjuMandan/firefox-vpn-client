@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math/rand/v2"
 	"net"
@@ -48,22 +49,26 @@ const (
 )
 
 const (
-	proxyPassRenewLead          = 2 * time.Minute
-	proxyPassRetryDelay         = 30 * time.Second
-	proxyPassRenewTimeout       = 2 * time.Minute
-	oauthRefreshLead            = 2 * time.Minute
-	maxOpenTunnelRebuildRetries = 3
-	defaultHandshakeTimeout     = 10 * time.Second
-	defaultIdleTimeout          = 0
-	defaultMaxConnections       = 256
-	defaultUpstreamConnections  = 1
-	upstreamSessionRetryDelay   = 10 * time.Second
-	copyBufferSize              = 64 * 1024
+	proxyPassRenewLead            = 2 * time.Minute
+	proxyPassRetryDelay           = 30 * time.Second
+	proxyPassRenewTimeout         = 2 * time.Minute
+	oauthRefreshLead              = 2 * time.Minute
+	maxOpenTunnelRebuildRetries   = 3
+	defaultHandshakeTimeout       = 10 * time.Second
+	defaultIdleTimeout            = 0
+	defaultMaxConnections         = 256
+	defaultUpstreamConnections    = 1
+	upstreamSessionRetryDelay     = 10 * time.Second
+	copyBufferSize                = 64 * 1024
+	halfCloseDrainTimeout         = 2 * time.Minute
+	maxDistinctOpenTimeoutTargets = 3
+	maxDistinctBadGatewayTargets  = 3
 )
 
 var (
 	errProxyHTTP2Unavailable = errors.New("proxy did not negotiate HTTP/2")
 	errProxyHTTP3Unavailable = errors.New("proxy did not negotiate HTTP/3")
+	errProxySessionUnhealthy = errors.New("upstream proxy session became unhealthy")
 	errNoUsableProxySession  = errors.New("no usable upstream proxy session")
 	errTunnelDeadline        = errors.New("deadlines are not supported for HTTP CONNECT tunnel streams")
 	verboseLogs              bool
@@ -156,8 +161,9 @@ func main() {
 	handshakeTimeoutFlag := flag.Duration("handshake-timeout", defaultHandshakeTimeout, "Maximum time allowed for a client SOCKS5 handshake; 0 disables the limit")
 	idleTimeoutFlag := flag.Duration("idle-timeout", defaultIdleTimeout, "Maximum idle time for an established tunnel; 0 disables the limit")
 	maxConnsFlag := flag.Int("max-conns", defaultMaxConnections, "Maximum concurrent client connections; 0 disables the limit")
-	upstreamConnsFlag := flag.Int("upstream-conns", defaultUpstreamConnections, "Number of upstream proxy sessions to keep open; values above 1 can improve parallel throughput")
+	upstreamConnsFlag := flag.Int("upstream-conns", defaultUpstreamConnections, "Number of upstream proxy sessions; client IP affinity is used when the value is above 1")
 	statusFileFlag := flag.String("status-file", "", "Write runtime health status JSON to this file; disabled when empty")
+	proxyStateFileFlag := flag.String("proxy-state-file", "", "Persist the automatically selected upstream proxy to this file; disabled when empty")
 	useH3Flag := flag.Bool("h3", false, "Use HTTP/3 (QUIC/UDP) instead of HTTP/2 (TCP) for the upstream connection")
 	verboseFlag := flag.Bool("verbose", false, "Enable verbose per-connection logs, including CONNECT target hosts")
 	flag.Parse()
@@ -171,16 +177,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	proxyFlagValue := strings.TrimSpace(*proxyFlag)
+	proxyStateFile := strings.TrimSpace(*proxyStateFileFlag)
+	hasPersistedProxy := false
+	if proxyFlagValue == "" && proxyStateFile != "" {
+		_, persistedErr := loadProxySelection(proxyStateFile)
+		hasPersistedProxy = persistedErr == nil
+	}
 	runtimeAuth, tokenSource, countries := prepareDemoInputs(
 		*loginFlag,
 		strings.TrimSpace(*sessionTokenFlag),
-		true,
+		*printInfoFlag || (proxyFlagValue == "" && !hasPersistedProxy),
 	)
 
-	selectedProxy, err := resolveProxy(strings.TrimSpace(*proxyFlag), countries)
+	selectedProxy, selectedFromState, err := resolveProxyWithState(proxyFlagValue, countries, proxyStateFile)
 	if err != nil {
 		logError("selecting proxy failed: %v", err)
 		os.Exit(1)
+	}
+	selectionSource := "automatic"
+	if proxyFlagValue != "" {
+		selectionSource = "configured"
+	} else if selectedFromState {
+		selectionSource = "persisted"
 	}
 
 	proxyURL, err := normalizeProxyURL(selectedProxy.Addr)
@@ -190,6 +209,17 @@ func main() {
 	}
 
 	pass, err := vpnclient.FetchProxyPass(*guardianFlag, runtimeAuth.Token.AccessToken)
+	if guardianStatusCode(err) == http.StatusUnauthorized {
+		logInfo("cached OAuth access was rejected by Guardian; refreshing token")
+		refreshedAuth, refreshErr := refreshRuntimeAuth(runtimeAuth)
+		if refreshErr != nil {
+			logError("refreshing OAuth token after Guardian rejection failed: %v", refreshErr)
+			os.Exit(1)
+		}
+		runtimeAuth = refreshedAuth
+		tokenSource = "refresh token after Guardian rejection"
+		pass, err = vpnclient.FetchProxyPass(*guardianFlag, runtimeAuth.Token.AccessToken)
+	}
 	if err != nil {
 		var guardianErr *vpnclient.GuardianHTTPError
 		if errors.As(err, &guardianErr) && guardianErr.StatusCode == http.StatusForbidden {
@@ -223,6 +253,16 @@ func main() {
 		StatusFile: strings.TrimSpace(*statusFileFlag),
 	})
 	if err != nil {
+		if selectedFromState && proxyStateFile != "" {
+			failures, cleared, recordErr := recordProxySelectionFailure(proxyStateFile, selectedProxy)
+			if recordErr != nil {
+				logWarn("recording persisted proxy failure failed path=%s err=%s", proxyStateFile, logErr(recordErr))
+			} else if cleared {
+				logWarn("persisted proxy failed repeatedly; selection cleared for next restart proxy=%s failures=%d", selectedProxy.Addr, failures)
+			} else {
+				logWarn("persisted proxy failed to establish; retaining selection until failure threshold proxy=%s failures=%d threshold=3", selectedProxy.Addr, failures)
+			}
+		}
 		switch {
 		case errors.Is(err, errProxyHTTP2Unavailable):
 			logError("upstream proxy does not support HTTP/2; refusing to start because this server must use a single upstream TCP connection")
@@ -234,6 +274,11 @@ func main() {
 		os.Exit(1)
 	}
 	localToExitLatency := time.Since(sessionStart).Round(time.Millisecond)
+	if proxyFlagValue == "" && proxyStateFile != "" {
+		if err := saveProxySelection(proxyStateFile, selectedProxy); err != nil {
+			logWarn("saving proxy selection failed path=%s err=%s", proxyStateFile, logErr(err))
+		}
+	}
 	defer controller.Close()
 	go controller.runRenewalLoop()
 
@@ -261,31 +306,66 @@ func main() {
 	} else {
 		logInfo("transport=http2 mode=%s renewal=background", upstreamMode(*upstreamConnsFlag))
 	}
-	logInfo("exit selected country=%q country_code=%s city=%q city_code=%s proxy=%s local_to_exit_latency=%s",
+	logInfo("exit selected country=%q country_code=%s city=%q city_code=%s proxy=%s selection_source=%s local_to_exit_latency=%s",
 		selectedProxy.CountryNameOrUnknown(),
 		selectedProxy.CountryCodeOrUnknown(),
 		selectedProxy.CityNameOrUnknown(),
 		selectedProxy.CityCodeOrUnknown(),
 		selectedProxy.Addr,
+		selectionSource,
 		localToExitLatency,
 	)
 
 	server := newSocksServer(controller, *handshakeTimeoutFlag, *idleTimeoutFlag, *maxConnsFlag)
 
+	var acceptRetryDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			logWarn("accept failed: %v", err)
+			if acceptRetryDelay == 0 {
+				acceptRetryDelay = 5 * time.Millisecond
+			} else {
+				acceptRetryDelay *= 2
+			}
+			if acceptRetryDelay > time.Second {
+				acceptRetryDelay = time.Second
+			}
+			logWarn("accept failed; retrying delay=%s err=%v", acceptRetryDelay, err)
+			time.Sleep(acceptRetryDelay)
 			continue
 		}
+		acceptRetryDelay = 0
 		go server.handleConn(conn)
 	}
+}
+
+func guardianStatusCode(err error) int {
+	var guardianErr *vpnclient.GuardianHTTPError
+	if errors.As(err, &guardianErr) {
+		return guardianErr.StatusCode
+	}
+	return 0
+}
+
+func refreshRuntimeAuth(auth *runtimeAuth) (*runtimeAuth, error) {
+	if auth == nil || auth.Token == nil || auth.Token.RefreshToken == "" {
+		return nil, fmt.Errorf("no refresh token available")
+	}
+	token, err := vpnclient.FxaRefreshToken(auth.Token.RefreshToken)
+	if err != nil {
+		return nil, err
+	}
+	if err := vpnclient.SaveTokens(token); err != nil {
+		logWarn("saving refreshed tokens failed: %v", err)
+	}
+	return &runtimeAuth{Token: token, ObtainedAt: time.Now()}, nil
 }
 
 func prepareDemoInputs(forceLogin bool, sessionToken string, needServerList bool) (*runtimeAuth, string, []vpnclient.Country) {
 
 	var token *vpnclient.TokenResponse
 	var tokenSource string
+	var tokenObtainedAt time.Time
 
 	if sessionToken != "" {
 		fmt.Print("Using provided session token... ")
@@ -297,12 +377,15 @@ func prepareDemoInputs(forceLogin bool, sessionToken string, needServerList bool
 		}
 		fmt.Println("OK")
 		tokenSource = "session-token flag"
+		tokenObtainedAt = time.Now()
 	} else {
-		token, tokenSource = obtainOAuthToken(forceLogin)
+		token, tokenSource, tokenObtainedAt = obtainOAuthToken(forceLogin)
 	}
 
-	if err := vpnclient.SaveTokens(token); err != nil {
-		logWarn("saving tokens failed: %v", err)
+	if tokenSource != "cached access token" {
+		if err := vpnclient.SaveTokens(token); err != nil {
+			logWarn("saving tokens failed: %v", err)
+		}
 	}
 
 	var countries []vpnclient.Country
@@ -316,7 +399,7 @@ func prepareDemoInputs(forceLogin bool, sessionToken string, needServerList bool
 
 	return &runtimeAuth{
 		Token:      token,
-		ObtainedAt: time.Now(),
+		ObtainedAt: tokenObtainedAt,
 	}, tokenSource, countries
 }
 
@@ -368,22 +451,34 @@ func upstreamMode(sessions int) string {
 	if sessions <= 1 {
 		return "single-upstream-connection"
 	}
-	return fmt.Sprintf("upstream-session-pool size=%d", sessions)
+	return fmt.Sprintf("upstream-session-pool size=%d affinity=client-ip failover", sessions)
 }
 
-func obtainOAuthToken(forceLogin bool) (*vpnclient.TokenResponse, string) {
+func obtainOAuthToken(forceLogin bool) (*vpnclient.TokenResponse, string, time.Time) {
 	if !forceLogin {
 		saved, err := vpnclient.LoadTokens()
-		if err == nil && saved.RefreshToken != "" {
-			fmt.Print("Refreshing token... ")
-			token, err := vpnclient.FxaRefreshToken(saved.RefreshToken)
-			if err != nil {
-				fmt.Printf("failed: %v\n", err)
-				logWarn("saved tokens were preserved; retry by restarting the program, or use -login to force a fresh login")
-				os.Exit(1)
+		if err == nil {
+			if saved.AccessTokenValid() {
+				fmt.Println("Using cached OAuth access token... OK")
+				return &vpnclient.TokenResponse{
+					AccessToken:  saved.AccessToken,
+					RefreshToken: saved.RefreshToken,
+					ExpiresIn:    saved.ExpiresIn,
+					Scope:        saved.Scope,
+					TokenType:    "bearer",
+				}, "cached access token", saved.ObtainedAt
 			}
-			fmt.Println("OK")
-			return token, "refresh token"
+			if saved.RefreshToken != "" {
+				fmt.Print("Refreshing token... ")
+				token, err := vpnclient.FxaRefreshToken(saved.RefreshToken)
+				if err != nil {
+					fmt.Printf("failed: %v\n", err)
+					logWarn("saved tokens were preserved; retry by restarting the program, or use -login to force a fresh login")
+					os.Exit(1)
+				}
+				fmt.Println("OK")
+				return token, "refresh token", time.Now()
+			}
 		}
 	}
 
@@ -404,7 +499,7 @@ func obtainOAuthToken(forceLogin bool) (*vpnclient.TokenResponse, string) {
 		os.Exit(1)
 	}
 	fmt.Println("OK")
-	return token, "fresh login"
+	return token, "fresh login", time.Now()
 }
 
 func promptCredentials() (string, string) {
@@ -430,6 +525,15 @@ type proxyCandidate struct {
 	CountryCode string
 	CityName    string
 	CityCode    string
+}
+
+type proxySelectionState struct {
+	Addr        string `json:"addr"`
+	CountryName string `json:"country_name,omitempty"`
+	CountryCode string `json:"country_code,omitempty"`
+	CityName    string `json:"city_name,omitempty"`
+	CityCode    string `json:"city_code,omitempty"`
+	Failures    int    `json:"consecutive_failures,omitempty"`
 }
 
 func (p proxyCandidate) CountryNameOrUnknown() string {
@@ -461,19 +565,143 @@ func (p proxyCandidate) CityCodeOrUnknown() string {
 }
 
 func resolveProxy(proxyFlag string, countries []vpnclient.Country) (proxyCandidate, error) {
+	candidate, _, err := resolveProxyWithState(proxyFlag, countries, "")
+	return candidate, err
+}
+
+func resolveProxyWithState(proxyFlag string, countries []vpnclient.Country, stateFile string) (proxyCandidate, bool, error) {
 	if proxyFlag != "" {
 		if matched, ok := findProxyCandidate(proxyFlag, countries); ok {
 			matched.Addr = proxyFlag
-			return matched, nil
+			return matched, false, nil
 		}
-		return proxyCandidate{Addr: proxyFlag}, nil
+		return proxyCandidate{Addr: proxyFlag}, false, nil
+	}
+
+	if stateFile != "" {
+		persisted, err := loadProxySelection(stateFile)
+		if err == nil {
+			if matched, ok := findProxyCandidate(persisted.Addr, countries); ok {
+				matched.Addr = persisted.Addr
+				return matched, true, nil
+			}
+			if len(countries) == 0 {
+				return persisted, true, nil
+			}
+			logWarn("persisted proxy is no longer present in server list; selecting a replacement proxy=%s", persisted.Addr)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			logWarn("loading persisted proxy selection failed path=%s err=%s", stateFile, logErr(err))
+		}
 	}
 
 	proxies := connectProxyCandidates(countries)
 	if len(proxies) == 0 {
-		return proxyCandidate{}, fmt.Errorf("no CONNECT proxies available from server list; pass -proxy explicitly")
+		return proxyCandidate{}, false, fmt.Errorf("no CONNECT proxies available from server list or persisted state; pass -proxy explicitly")
 	}
-	return proxies[rand.IntN(len(proxies))], nil
+	return proxies[rand.IntN(len(proxies))], false, nil
+}
+
+func loadProxySelection(path string) (proxyCandidate, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return proxyCandidate{}, err
+	}
+	var state proxySelectionState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return proxyCandidate{}, err
+	}
+	if _, err := canonicalProxyAddr(state.Addr); err != nil {
+		return proxyCandidate{}, fmt.Errorf("invalid persisted proxy %q: %w", state.Addr, err)
+	}
+	return proxyCandidate{
+		Addr:        state.Addr,
+		CountryName: state.CountryName,
+		CountryCode: state.CountryCode,
+		CityName:    state.CityName,
+		CityCode:    state.CityCode,
+	}, nil
+}
+
+func saveProxySelection(path string, candidate proxyCandidate) error {
+	if path == "" {
+		return nil
+	}
+	if _, err := canonicalProxyAddr(candidate.Addr); err != nil {
+		return err
+	}
+	return writeProxySelectionState(path, proxySelectionState{
+		Addr:        candidate.Addr,
+		CountryName: candidate.CountryName,
+		CountryCode: candidate.CountryCode,
+		CityName:    candidate.CityName,
+		CityCode:    candidate.CityCode,
+	})
+}
+
+func recordProxySelectionFailure(path string, candidate proxyCandidate) (int, bool, error) {
+	state := proxySelectionState{
+		Addr:        candidate.Addr,
+		CountryName: candidate.CountryName,
+		CountryCode: candidate.CountryCode,
+		CityName:    candidate.CityName,
+		CityCode:    candidate.CityCode,
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		var existing proxySelectionState
+		if json.Unmarshal(data, &existing) == nil {
+			existingAddr, existingErr := canonicalProxyAddr(existing.Addr)
+			candidateAddr, candidateErr := canonicalProxyAddr(candidate.Addr)
+			if existingErr == nil && candidateErr == nil && existingAddr == candidateAddr {
+				state = existing
+			}
+		}
+	}
+	state.Failures++
+	if state.Failures >= 3 {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return state.Failures, false, err
+		}
+		return state.Failures, true, nil
+	}
+	return state.Failures, false, writeProxySelectionState(path, state)
+}
+
+func writeProxySelectionState(path string, state proxySelectionState) error {
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return err
+		}
+		if retryErr := os.Rename(tmpName, path); retryErr != nil {
+			return retryErr
+		}
+	}
+	return os.Chmod(path, 0600)
 }
 
 func findProxyCandidate(proxyFlag string, countries []vpnclient.Country) (proxyCandidate, bool) {
@@ -571,6 +799,61 @@ type tunnelOpener interface {
 	OpenTunnel(authority string) (net.Conn, error)
 }
 
+// clientAffinityTunnelOpener keeps a client's tunnels on one upstream session
+// when the implementation can provide session affinity.
+type clientAffinityTunnelOpener interface {
+	OpenTunnelForClient(authority, clientKey string) (net.Conn, error)
+}
+
+type proxySessionTokenUpdater interface {
+	UpdateToken(token string) error
+}
+
+type sessionFailureTracker struct {
+	mu                 sync.Mutex
+	openTimeoutTargets map[string]struct{}
+	badGatewayTargets  map[string]struct{}
+}
+
+func (t *sessionFailureTracker) observe(authority string, err error) error {
+	if err == nil {
+		t.mu.Lock()
+		t.openTimeoutTargets = nil
+		t.badGatewayTargets = nil
+		t.mu.Unlock()
+		return nil
+	}
+
+	var timeoutErr *tunnelOpenTimeoutError
+	var connectErr *proxyConnectHTTPError
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch {
+	case errors.As(err, &timeoutErr):
+		if t.openTimeoutTargets == nil {
+			t.openTimeoutTargets = make(map[string]struct{})
+		}
+		t.openTimeoutTargets[authority] = struct{}{}
+		t.badGatewayTargets = nil
+		if len(t.openTimeoutTargets) >= maxDistinctOpenTimeoutTargets {
+			return fmt.Errorf("%w: %w", errProxySessionUnhealthy, err)
+		}
+	case errors.As(err, &connectErr) && connectErr.statusCode == http.StatusBadGateway:
+		if t.badGatewayTargets == nil {
+			t.badGatewayTargets = make(map[string]struct{})
+		}
+		t.badGatewayTargets[authority] = struct{}{}
+		t.openTimeoutTargets = nil
+		if len(t.badGatewayTargets) >= maxDistinctBadGatewayTargets {
+			return fmt.Errorf("%w: %w", errProxySessionUnhealthy, err)
+		}
+	default:
+		t.openTimeoutTargets = nil
+		t.badGatewayTargets = nil
+	}
+	return err
+}
+
 type proxySession interface {
 	tunnelOpener
 	Close() error
@@ -585,9 +868,13 @@ type pooledProxySession struct {
 }
 
 type proxySessionPool struct {
-	create   func() (proxySession, error)
-	sessions []*pooledProxySession
-	next     atomic.Uint64
+	create         func() (proxySession, error)
+	setCreateToken func(string)
+	sessions       []*pooledProxySession
+	clientSlots    map[string]int
+	next           atomic.Uint64
+	tokenMu        sync.RWMutex
+	currentToken   string
 
 	mu        sync.Mutex
 	closed    bool
@@ -595,15 +882,19 @@ type proxySessionPool struct {
 	closeOnce sync.Once
 }
 
-func newProxySessionPool(size int, create func() (proxySession, error)) (*proxySessionPool, error) {
+func newProxySessionPool(size int, create func() (proxySession, error), setCreateToken ...func(string)) (*proxySessionPool, error) {
 	if size < 1 {
 		return nil, fmt.Errorf("upstream session pool size must be at least 1")
 	}
 
 	pool := &proxySessionPool{
-		create:   create,
-		sessions: make([]*pooledProxySession, size),
-		done:     make(chan struct{}),
+		create:      create,
+		sessions:    make([]*pooledProxySession, size),
+		clientSlots: make(map[string]int),
+		done:        make(chan struct{}),
+	}
+	if len(setCreateToken) > 0 {
+		pool.setCreateToken = setCreateToken[0]
 	}
 	successes := 0
 	var firstErr error
@@ -624,14 +915,14 @@ func newProxySessionPool(size int, create func() (proxySession, error)) (*proxyS
 		return nil, fmt.Errorf("creating upstream session pool: %w", firstErr)
 	}
 	if successes < size {
-		logWarn("upstream proxy session pool partially established available=%d desired=%d", successes, size)
+		logWarn("upstream proxy session pool partially established available=%d desired=%d affinity=client-ip failover=enabled", successes, size)
 		for i := range pool.sessions {
 			if pool.sessions[i] == nil {
 				go pool.replenishSlot(i)
 			}
 		}
 	} else {
-		logInfo("upstream proxy session pool established size=%d", successes)
+		logInfo("upstream proxy session pool established size=%d affinity=client-ip failover=enabled", successes)
 	}
 	return pool, nil
 }
@@ -644,11 +935,77 @@ func newPooledProxySession(session proxySession) *pooledProxySession {
 }
 
 func (p *proxySessionPool) OpenTunnel(authority string) (net.Conn, error) {
+	return p.openTunnel(authority, "")
+}
+
+func (p *proxySessionPool) OpenTunnelForClient(authority, clientKey string) (net.Conn, error) {
+	return p.openTunnel(authority, clientKey)
+}
+
+func (p *proxySessionPool) UpdateToken(token string) error {
+	if strings.TrimSpace(token) == "" {
+		return fmt.Errorf("empty proxy session token")
+	}
+	if p == nil {
+		return errNoUsableProxySession
+	}
+	p.tokenMu.Lock()
+	p.currentToken = token
+	p.tokenMu.Unlock()
+	if p.setCreateToken != nil {
+		p.setCreateToken(token)
+	}
+
+	p.mu.Lock()
+	sessions := append([]*pooledProxySession(nil), p.sessions...)
+	p.mu.Unlock()
+	updated := 0
+	for _, pooled := range sessions {
+		if pooled == nil {
+			continue
+		}
+		session, ok := pooled.acquire()
+		if !ok {
+			continue
+		}
+		updater, ok := session.(proxySessionTokenUpdater)
+		if !ok {
+			pooled.release()
+			return fmt.Errorf("upstream session does not support token update")
+		}
+		if err := updater.UpdateToken(token); err != nil {
+			pooled.release()
+			return err
+		}
+		pooled.release()
+		updated++
+	}
+	if updated == 0 {
+		return errNoUsableProxySession
+	}
+	return nil
+}
+
+func (p *proxySessionPool) applyCurrentToken(session proxySession) error {
+	p.tokenMu.RLock()
+	token := p.currentToken
+	p.tokenMu.RUnlock()
+	if token == "" {
+		return nil
+	}
+	updater, ok := session.(proxySessionTokenUpdater)
+	if !ok {
+		return fmt.Errorf("upstream session does not support token update")
+	}
+	return updater.UpdateToken(token)
+}
+
+func (p *proxySessionPool) openTunnel(authority, clientKey string) (net.Conn, error) {
 	if p == nil || len(p.sessions) == 0 {
 		return nil, errNoUsableProxySession
 	}
 
-	start := int((p.next.Add(1) - 1) % uint64(len(p.sessions)))
+	start := p.nextSlot(clientKey)
 	var lastErr error
 	for i := 0; i < len(p.sessions); i++ {
 		slot := (start + i) % len(p.sessions)
@@ -662,6 +1019,7 @@ func (p *proxySessionPool) OpenTunnel(authority string) (net.Conn, error) {
 		}
 		conn, err := session.OpenTunnel(authority)
 		if err == nil {
+			p.rememberClientSlot(clientKey, start, slot)
 			return &pooledTunnelConn{
 				Conn:    conn,
 				release: pooled.release,
@@ -672,12 +1030,55 @@ func (p *proxySessionPool) OpenTunnel(authority string) (net.Conn, error) {
 		if !shouldRebuildProxySession(err) {
 			return nil, err
 		}
+		p.setClientFallback(clientKey, start, slot, (slot+1)%len(p.sessions))
 		p.retireSlot(slot, pooled)
 	}
 	if lastErr != nil {
 		return nil, lastErr
 	}
 	return nil, errNoUsableProxySession
+}
+
+func (p *proxySessionPool) nextSlot(clientKey string) int {
+	if clientKey == "" {
+		return int((p.next.Add(1) - 1) % uint64(len(p.sessions)))
+	}
+
+	p.mu.Lock()
+	if slot, ok := p.clientSlots[clientKey]; ok {
+		p.mu.Unlock()
+		return slot
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(clientKey))
+	slot := int(h.Sum32() % uint32(len(p.sessions)))
+	p.clientSlots[clientKey] = slot
+	p.mu.Unlock()
+	return slot
+}
+
+func (p *proxySessionPool) rememberClientSlot(clientKey string, initialSlot, actualSlot int) {
+	if clientKey == "" || initialSlot == actualSlot {
+		return
+	}
+	p.mu.Lock()
+	currentSlot, ok := p.clientSlots[clientKey]
+	if !p.closed && ok && (currentSlot == initialSlot || p.sessions[currentSlot] == nil) {
+		p.clientSlots[clientKey] = actualSlot
+	}
+	p.mu.Unlock()
+}
+
+func (p *proxySessionPool) setClientFallback(clientKey string, initialSlot, failedSlot, fallbackSlot int) {
+	if clientKey == "" {
+		return
+	}
+	p.mu.Lock()
+	currentSlot, ok := p.clientSlots[clientKey]
+	if !p.closed && ok && (currentSlot == initialSlot || currentSlot == failedSlot || p.sessions[currentSlot] == nil) {
+		p.clientSlots[clientKey] = fallbackSlot
+	}
+	p.mu.Unlock()
 }
 
 func (p *proxySessionPool) Close() error {
@@ -742,6 +1143,14 @@ func (p *proxySessionPool) replenishSlot(i int) {
 		session, err := p.create()
 		if err != nil {
 			logWarn("replenishing upstream session failed slot=%d err=%s", i+1, logErr(err))
+			if !p.waitOrClosed(upstreamSessionRetryDelay) {
+				return
+			}
+			continue
+		}
+		if err := p.applyCurrentToken(session); err != nil {
+			_ = session.Close()
+			logWarn("applying renewed token to replenished upstream session failed slot=%d err=%s", i+1, logErr(err))
 			if !p.waitOrClosed(upstreamSessionRetryDelay) {
 				return
 			}
@@ -946,7 +1355,12 @@ func (s *socksServer) handleConn(conn net.Conn) {
 	}
 	logDebug("SOCKS5 CONNECT requested client=%s target=%s", clientAddr, logTarget(target))
 
-	upstreamConn, err := s.upstream.OpenTunnel(target)
+	var upstreamConn net.Conn
+	if affinityUpstream, ok := s.upstream.(clientAffinityTunnelOpener); ok {
+		upstreamConn, err = affinityUpstream.OpenTunnelForClient(target, clientAffinityKey(conn.RemoteAddr()))
+	} else {
+		upstreamConn, err = s.upstream.OpenTunnel(target)
+	}
 	if err != nil {
 		reply := mapUpstreamError(err)
 		logWarn("upstream tunnel open failed client=%s target=%s reply=%d err=%s", clientAddr, logTarget(target), reply, logErr(err))
@@ -965,6 +1379,19 @@ func (s *socksServer) handleConn(conn net.Conn) {
 	logDebug("upstream tunnel open succeeded client=%s target=%s", clientAddr, logTarget(target))
 	proxyBidirectional(conn, upstreamConn, s.idleTimeout)
 	logDebug("client disconnected client=%s target=%s duration=%s", clientAddr, logTarget(target), time.Since(start).Round(time.Millisecond))
+}
+
+func clientAffinityKey(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	if tcpAddr, ok := addr.(*net.TCPAddr); ok && tcpAddr.IP != nil {
+		return tcpAddr.IP.String()
+	}
+	if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+		return host
+	}
+	return addr.String()
 }
 
 func handshakeSOCKS5(conn net.Conn) (string, byte, error) {
@@ -1088,7 +1515,8 @@ func mapUpstreamError(err error) byte {
 	if errors.Is(err, errUnsupportedAddrType) {
 		return socksReplyAtypUnsup
 	}
-	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		return socksReplyHostUnrch
 	}
 	return socksReplyFailure
@@ -1124,6 +1552,9 @@ func (e *proxyConnectHTTPError) Error() string {
 }
 
 func shouldRebuildProxySession(err error) bool {
+	if errors.Is(err, errProxySessionUnhealthy) {
+		return true
+	}
 	var connectErr *proxyConnectHTTPError
 	if errors.As(err, &connectErr) {
 		switch connectErr.statusCode {
@@ -1179,9 +1610,14 @@ func roundTripWithOpenTimeout(timeout time.Duration, do func(context.Context) (*
 	case <-timer.C:
 		cancel()
 		go func() {
-			result := <-resultCh
-			if result.resp != nil && result.resp.Body != nil {
-				_ = result.resp.Body.Close()
+			cleanupTimer := time.NewTimer(timeout)
+			defer cleanupTimer.Stop()
+			select {
+			case result := <-resultCh:
+				if result.resp != nil && result.resp.Body != nil {
+					_ = result.resp.Body.Close()
+				}
+			case <-cleanupTimer.C:
 			}
 		}()
 		return nil, nil, &tunnelOpenTimeoutError{timeout: timeout}
@@ -1189,8 +1625,6 @@ func roundTripWithOpenTimeout(timeout time.Duration, do func(context.Context) (*
 }
 
 func proxyBidirectional(clientConn, upstreamConn net.Conn, idleTimeout time.Duration) {
-	var wg sync.WaitGroup
-	wg.Add(2)
 	var activity func()
 	done := make(chan struct{})
 
@@ -1207,19 +1641,49 @@ func proxyBidirectional(clientConn, upstreamConn net.Conn, idleTimeout time.Dura
 		activity = func() {}
 	}
 
+	results := make(chan error, 2)
 	go func() {
-		defer wg.Done()
-		copyConn(upstreamConn, clientConn, activity)
-		closeWrite(upstreamConn)
+		err := copyConn(upstreamConn, clientConn, activity)
+		if err == nil {
+			closeWrite(upstreamConn)
+		}
+		results <- err
 	}()
 
 	go func() {
-		defer wg.Done()
-		copyConn(clientConn, upstreamConn, activity)
-		closeWrite(clientConn)
+		err := copyConn(clientConn, upstreamConn, activity)
+		if err == nil {
+			closeWrite(clientConn)
+		}
+		results <- err
 	}()
 
-	wg.Wait()
+	firstErr := <-results
+	if firstErr != nil {
+		_ = clientConn.Close()
+		_ = upstreamConn.Close()
+	}
+	var secondErr error
+	if firstErr == nil {
+		drainTimer := time.NewTimer(halfCloseDrainTimeout)
+		select {
+		case secondErr = <-results:
+			if !drainTimer.Stop() {
+				<-drainTimer.C
+			}
+		case <-drainTimer.C:
+			logDebug("closing half-closed tunnel after drain timeout=%s", halfCloseDrainTimeout)
+			_ = clientConn.Close()
+			_ = upstreamConn.Close()
+			secondErr = <-results
+		}
+	} else {
+		secondErr = <-results
+	}
+	if secondErr != nil {
+		_ = clientConn.Close()
+		_ = upstreamConn.Close()
+	}
 	close(done)
 }
 
@@ -1246,7 +1710,7 @@ func closeIdleConns(clientConn, upstreamConn net.Conn, idleTimeout time.Duration
 	}
 }
 
-func copyConn(dst, src net.Conn, activity func()) {
+func copyConn(dst, src net.Conn, activity func()) error {
 	buf := copyBufferPool.Get().([]byte)
 	defer copyBufferPool.Put(buf)
 
@@ -1259,14 +1723,17 @@ func copyConn(dst, src net.Conn, activity func()) {
 				activity()
 			}
 			if writeErr != nil {
-				return
+				return writeErr
 			}
 			if nw != nr {
-				return
+				return io.ErrShortWrite
 			}
 		}
 		if readErr != nil {
-			return
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
 		}
 	}
 }
@@ -1283,6 +1750,10 @@ type h2ProxySession struct {
 	proxyHost string
 	token     string
 	timeout   time.Duration
+	tokenMu   sync.RWMutex
+	health    sessionFailureTracker
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func newH2ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (*h2ProxySession, error) {
@@ -1306,7 +1777,12 @@ func newH2ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (
 		return nil, errProxyHTTP2Unavailable
 	}
 
-	cc, err := new(http2.Transport).NewClientConn(proxyTLS)
+	transport := &http2.Transport{
+		ReadIdleTimeout:  30 * time.Second,
+		PingTimeout:      15 * time.Second,
+		WriteByteTimeout: 30 * time.Second,
+	}
+	cc, err := transport.NewClientConn(proxyTLS)
 	if err != nil {
 		_ = proxyTLS.Close()
 		return nil, err
@@ -1331,26 +1807,27 @@ func (s *h2ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 		}
 		req.Host = authority
 		req.URL.Host = s.proxyHost
-		req.Header.Set("Proxy-Authorization", "Bearer "+s.token)
+		req.Header.Set("Proxy-Authorization", "Bearer "+s.bearerToken())
 		return s.cc.RoundTrip(req)
 	})
 	if err != nil {
 		_ = pr.Close()
 		_ = pw.Close()
-		return nil, err
+		return nil, s.health.observe(authority, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		cancel()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		_ = resp.Body.Close()
-		cancel()
 		_ = pr.Close()
 		_ = pw.Close()
-		return nil, &proxyConnectHTTPError{
+		return nil, s.health.observe(authority, &proxyConnectHTTPError{
 			statusCode: resp.StatusCode,
 			status:     resp.Status,
 			body:       strings.TrimSpace(string(body)),
-		}
+		})
 	}
+	s.health.observe(authority, nil)
 
 	return &tunnelConn{
 		reader:  resp.Body,
@@ -1361,19 +1838,34 @@ func (s *h2ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 	}, nil
 }
 
+func (s *h2ProxySession) bearerToken() string {
+	s.tokenMu.RLock()
+	defer s.tokenMu.RUnlock()
+	return s.token
+}
+
+func (s *h2ProxySession) UpdateToken(token string) error {
+	if strings.TrimSpace(token) == "" {
+		return fmt.Errorf("empty proxy session token")
+	}
+	s.tokenMu.Lock()
+	s.token = token
+	s.tokenMu.Unlock()
+	return nil
+}
+
 func (s *h2ProxySession) Close() error {
-	var err error
-	if s.cc != nil {
-		err = s.cc.Close()
-		s.cc = nil
-	}
-	if s.raw != nil {
-		if closeErr := s.raw.Close(); err == nil {
-			err = closeErr
+	s.closeOnce.Do(func() {
+		if s.cc != nil {
+			s.closeErr = s.cc.Close()
 		}
-		s.raw = nil
-	}
-	return err
+		if s.raw != nil {
+			if closeErr := s.raw.Close(); s.closeErr == nil {
+				s.closeErr = closeErr
+			}
+		}
+	})
+	return s.closeErr
 }
 
 // h3ProxySession holds a single QUIC connection used for HTTP/3 CONNECT tunnels.
@@ -1384,6 +1876,10 @@ type h3ProxySession struct {
 	proxyHost string
 	token     string
 	timeout   time.Duration
+	tokenMu   sync.RWMutex
+	health    sessionFailureTracker
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func newH3ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (*h3ProxySession, error) {
@@ -1494,26 +1990,27 @@ func (s *h3ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 		}
 		req.Host = authority
 		req.URL.Host = s.proxyHost
-		req.Header.Set("Proxy-Authorization", "Bearer "+s.token)
+		req.Header.Set("Proxy-Authorization", "Bearer "+s.bearerToken())
 		return s.rt.RoundTrip(req)
 	})
 	if err != nil {
 		_ = pr.Close()
 		_ = pw.Close()
-		return nil, err
+		return nil, s.health.observe(authority, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		cancel()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		_ = resp.Body.Close()
-		cancel()
 		_ = pr.Close()
 		_ = pw.Close()
-		return nil, &proxyConnectHTTPError{
+		return nil, s.health.observe(authority, &proxyConnectHTTPError{
 			statusCode: resp.StatusCode,
 			status:     resp.Status,
 			body:       strings.TrimSpace(string(body)),
-		}
+		})
 	}
+	s.health.observe(authority, nil)
 
 	return &tunnelConn{
 		reader:  resp.Body,
@@ -1524,20 +2021,37 @@ func (s *h3ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 	}, nil
 }
 
+func (s *h3ProxySession) bearerToken() string {
+	s.tokenMu.RLock()
+	defer s.tokenMu.RUnlock()
+	return s.token
+}
+
+func (s *h3ProxySession) UpdateToken(token string) error {
+	if strings.TrimSpace(token) == "" {
+		return fmt.Errorf("empty proxy session token")
+	}
+	s.tokenMu.Lock()
+	s.token = token
+	s.tokenMu.Unlock()
+	return nil
+}
+
 func (s *h3ProxySession) Close() error {
-	if s.rt != nil {
-		_ = s.rt.Close()
-	}
-	var err error
-	if s.conn != nil {
-		err = s.conn.CloseWithError(0, "")
-	}
-	if s.udpConn != nil {
-		if closeErr := s.udpConn.Close(); err == nil {
-			err = closeErr
+	s.closeOnce.Do(func() {
+		if s.rt != nil {
+			_ = s.rt.Close()
 		}
-	}
-	return err
+		if s.conn != nil {
+			s.closeErr = s.conn.CloseWithError(0, "")
+		}
+		if s.udpConn != nil {
+			if closeErr := s.udpConn.Close(); s.closeErr == nil {
+				s.closeErr = closeErr
+			}
+		}
+	})
+	return s.closeErr
 }
 
 type tunnelConn struct {
@@ -1677,8 +2191,17 @@ func newProxyController(cfg proxyControllerConfig) (*proxyController, error) {
 		if sessions == 1 {
 			return baseFactory(token)
 		}
+		var tokenMu sync.RWMutex
+		createToken := token
 		return newProxySessionPool(sessions, func() (proxySession, error) {
-			return baseFactory(token)
+			tokenMu.RLock()
+			currentToken := createToken
+			tokenMu.RUnlock()
+			return baseFactory(currentToken)
+		}, func(newToken string) {
+			tokenMu.Lock()
+			createToken = newToken
+			tokenMu.Unlock()
 		})
 	}
 
@@ -1706,6 +2229,14 @@ func newProxyController(cfg proxyControllerConfig) (*proxyController, error) {
 }
 
 func (c *proxyController) OpenTunnel(authority string) (net.Conn, error) {
+	return c.openTunnel(authority, "")
+}
+
+func (c *proxyController) OpenTunnelForClient(authority, clientKey string) (net.Conn, error) {
+	return c.openTunnel(authority, clientKey)
+}
+
+func (c *proxyController) openTunnel(authority, clientKey string) (net.Conn, error) {
 	var lastErr error
 	for attempt := 0; attempt <= maxOpenTunnelRebuildRetries; attempt++ {
 		var failedSession *managedSession
@@ -1718,7 +2249,12 @@ func (c *proxyController) OpenTunnel(authority string) (net.Conn, error) {
 				lastErr = err
 			}
 		} else {
-			conn, err := ms.session.OpenTunnel(authority)
+			var conn net.Conn
+			if affinitySession, ok := ms.session.(clientAffinityTunnelOpener); ok {
+				conn, err = affinitySession.OpenTunnelForClient(authority, clientKey)
+			} else {
+				conn, err = ms.session.OpenTunnel(authority)
+			}
 			if err == nil {
 				return &managedTunnelConn{
 					Conn:    conn,
@@ -1799,8 +2335,13 @@ func (c *proxyController) maybeCloseLocked(ms *managedSession) {
 	ms.session = nil
 }
 
-func (c *proxyController) swapSession(newSession proxySession, expiresAt time.Time) {
+func (c *proxyController) swapSession(newSession proxySession, expiresAt time.Time) bool {
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		_ = newSession.Close()
+		return false
+	}
 	old := c.current
 	c.current = &managedSession{
 		session:   newSession,
@@ -1813,6 +2354,7 @@ func (c *proxyController) swapSession(newSession proxySession, expiresAt time.Ti
 	}
 	c.mu.Unlock()
 	c.writeStatus("session_swapped")
+	return true
 }
 
 func (c *proxyController) disableExpiredSession(now time.Time) {
@@ -2046,13 +2588,40 @@ func (c *proxyController) renewLocked() error {
 	}
 	logProxyPassTimeCorrection(pass)
 
+	if err := c.updateCurrentSessionToken(pass.RawToken, pass.ExpiresAt()); err == nil {
+		c.writeStatus("token_updated")
+		logInfo("proxy pass renewed successfully next_expiry=%s session=retained", pass.ExpiresAt().Format(time.RFC3339))
+		return nil
+	} else {
+		logDebug("existing upstream session cannot accept renewed proxy pass; rebuilding err=%s", logErr(err))
+	}
+
 	session, err := c.sessionFactory(pass.RawToken)
 	if err != nil {
 		return err
 	}
 
-	c.swapSession(session, pass.ExpiresAt())
+	if !c.swapSession(session, pass.ExpiresAt()) {
+		return errNoUsableProxySession
+	}
 	logInfo("proxy pass renewed successfully next_expiry=%s", pass.ExpiresAt().Format(time.RFC3339))
+	return nil
+}
+
+func (c *proxyController) updateCurrentSessionToken(token string, expiresAt time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.current == nil || !c.current.accepting || !time.Now().Before(c.current.expiresAt) {
+		return errNoUsableProxySession
+	}
+	updater, ok := c.current.session.(proxySessionTokenUpdater)
+	if !ok {
+		return fmt.Errorf("upstream session does not support token update")
+	}
+	if err := updater.UpdateToken(token); err != nil {
+		return err
+	}
+	c.current.expiresAt = expiresAt
 	return nil
 }
 
@@ -2070,17 +2639,9 @@ func (c *proxyController) ensureOAuthToken() (*runtimeAuth, error) {
 	}
 
 	logInfo("refreshing OAuth token")
-	token, err := vpnclient.FxaRefreshToken(auth.Token.RefreshToken)
+	refreshed, err := refreshRuntimeAuth(auth)
 	if err != nil {
 		return nil, err
-	}
-
-	refreshed := &runtimeAuth{
-		Token:      token,
-		ObtainedAt: now,
-	}
-	if err := vpnclient.SaveTokens(token); err != nil {
-		logWarn("saving refreshed tokens failed: %v", err)
 	}
 
 	c.mu.Lock()
@@ -2100,9 +2661,12 @@ func (c *proxyController) Close() error {
 		defer c.mu.Unlock()
 
 		c.closed = true
-		if c.current != nil && c.current.session != nil {
-			c.closeErr = c.current.session.Close()
-			c.current.session = nil
+		if c.current != nil {
+			c.current.accepting = false
+			if c.current.session != nil {
+				c.closeErr = c.current.session.Close()
+				c.current.session = nil
+			}
 		}
 	})
 	c.writeStatus("closed")

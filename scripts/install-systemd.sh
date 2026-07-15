@@ -15,6 +15,7 @@ HEALTH_TIMER_FILE="${HEALTH_TIMER_FILE:-/etc/systemd/system/$SERVICE_NAME-health
 CONFIG_KEYS=(
   LISTEN
   PROXY
+  PROXY_STATE_FILE
   GUARDIAN
   TIMEOUT
   HANDSHAKE_TIMEOUT
@@ -29,6 +30,8 @@ CONFIG_KEYS=(
   HEALTH_VERBOSE
   HEALTH_TARGET
   HEALTH_TARGETS
+  HEALTH_FAILURE_THRESHOLD
+  HEALTH_FAILURE_STATE
   HEALTH_STATUS_GRACE
   STATUS_FILE
 )
@@ -42,6 +45,7 @@ done
 
 LISTEN="${LISTEN:-127.0.0.1:1080}"
 PROXY="${PROXY:-}"
+PROXY_STATE_FILE="${PROXY_STATE_FILE:-$STATE_DIR/proxy-selection.json}"
 GUARDIAN="${GUARDIAN:-}"
 TIMEOUT="${TIMEOUT:-20s}"
 HANDSHAKE_TIMEOUT="${HANDSHAKE_TIMEOUT:-10s}"
@@ -64,6 +68,8 @@ if [[ -z "$HEALTH_TARGETS" ]]; then
   fi
 fi
 HEALTH_STATUS_GRACE="${HEALTH_STATUS_GRACE:-30}"
+HEALTH_FAILURE_THRESHOLD="${HEALTH_FAILURE_THRESHOLD:-3}"
+HEALTH_FAILURE_STATE="${HEALTH_FAILURE_STATE:-$STATE_DIR/health-failures}"
 STATUS_FILE="${STATUS_FILE:-$STATE_DIR/status.json}"
 PURGE="${PURGE:-0}"
 SKIP_START="${SKIP_START:-0}"
@@ -97,6 +103,7 @@ Common environment overrides:
   BIN_PATH=$BIN_PATH
   LISTEN=$LISTEN
   PROXY=$PROXY
+  PROXY_STATE_FILE=$PROXY_STATE_FILE
   TIMEOUT=$TIMEOUT
   HANDSHAKE_TIMEOUT=$HANDSHAKE_TIMEOUT
   IDLE_TIMEOUT=$IDLE_TIMEOUT
@@ -109,6 +116,8 @@ Common environment overrides:
   HEALTH_VERBOSE=$HEALTH_VERBOSE
   HEALTH_TARGET=$HEALTH_TARGET
   HEALTH_TARGETS=$HEALTH_TARGETS
+  HEALTH_FAILURE_THRESHOLD=$HEALTH_FAILURE_THRESHOLD
+  HEALTH_FAILURE_STATE=$HEALTH_FAILURE_STATE
   HEALTH_STATUS_GRACE=$HEALTH_STATUS_GRACE
   STATUS_FILE=$STATUS_FILE
   EXTRA_ARGS="$EXTRA_ARGS"
@@ -214,6 +223,7 @@ write_env_file() {
     write_env_var BIN_PATH "$BIN_PATH"
     write_env_var LISTEN "$LISTEN"
     write_env_var PROXY "$PROXY"
+    write_env_var PROXY_STATE_FILE "$PROXY_STATE_FILE"
     write_env_var GUARDIAN "$GUARDIAN"
     write_env_var TIMEOUT "$TIMEOUT"
     write_env_var HANDSHAKE_TIMEOUT "$HANDSHAKE_TIMEOUT"
@@ -228,6 +238,8 @@ write_env_file() {
     write_env_var HEALTH_VERBOSE "$HEALTH_VERBOSE"
     write_env_var HEALTH_TARGET "$HEALTH_TARGET"
     write_env_var HEALTH_TARGETS "$HEALTH_TARGETS"
+    write_env_var HEALTH_FAILURE_THRESHOLD "$HEALTH_FAILURE_THRESHOLD"
+    write_env_var HEALTH_FAILURE_STATE "$HEALTH_FAILURE_STATE"
     write_env_var HEALTH_STATUS_GRACE "$HEALTH_STATUS_GRACE"
     write_env_var STATUS_FILE "$STATUS_FILE"
   } > "$ENV_FILE"
@@ -257,8 +269,9 @@ MAX_CONNS="${MAX_CONNS:-256}"
 UPSTREAM_CONNS="${UPSTREAM_CONNS:-1}"
 IDLE_TIMEOUT="${IDLE_TIMEOUT:-0}"
 STATUS_FILE="${STATUS_FILE:-}"
+PROXY_STATE_FILE="${PROXY_STATE_FILE:-}"
 
-args=(-listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -idle-timeout "$IDLE_TIMEOUT" -max-conns "$MAX_CONNS" -upstream-conns "$UPSTREAM_CONNS" -status-file "$STATUS_FILE")
+args=(-listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -idle-timeout "$IDLE_TIMEOUT" -max-conns "$MAX_CONNS" -upstream-conns "$UPSTREAM_CONNS" -status-file "$STATUS_FILE" -proxy-state-file "$PROXY_STATE_FILE")
 
 if [[ -n "${PROXY:-}" ]]; then
   args+=(-proxy "$PROXY")
@@ -305,6 +318,8 @@ HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-5}"
 HEALTH_VERBOSE="${HEALTH_VERBOSE:-0}"
 STATUS_FILE="${STATUS_FILE:-}"
 HEALTH_STATUS_GRACE="${HEALTH_STATUS_GRACE:-30}"
+HEALTH_FAILURE_THRESHOLD="${HEALTH_FAILURE_THRESHOLD:-3}"
+HEALTH_FAILURE_STATE="${HEALTH_FAILURE_STATE:-/var/lib/$SERVICE_NAME/health-failures}"
 HEALTH_TARGETS="${HEALTH_TARGETS:-}"
 if [[ -z "$HEALTH_TARGETS" ]]; then
   if [[ -n "${HEALTH_TARGET:-}" ]]; then
@@ -320,6 +335,7 @@ log() {
 
 restart_service() {
   log WARN "restarting $SERVICE_NAME"
+  systemctl reset-failed "$SERVICE_NAME.service" >/dev/null 2>&1 || true
   systemctl restart "$SERVICE_NAME.service"
 }
 
@@ -327,6 +343,29 @@ fail() {
   log ERROR "$1"
   restart_service
   exit 1
+}
+
+record_data_failure() {
+  local message="$1"
+  local count=0
+  if [[ -r "$HEALTH_FAILURE_STATE" ]]; then
+    read -r count < "$HEALTH_FAILURE_STATE" || count=0
+  fi
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  [[ "$HEALTH_FAILURE_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || HEALTH_FAILURE_THRESHOLD=3
+  count=$((count + 1))
+  mkdir -p "$(dirname -- "$HEALTH_FAILURE_STATE")"
+  printf '%s\n' "$count" > "$HEALTH_FAILURE_STATE"
+  if (( count < HEALTH_FAILURE_THRESHOLD )); then
+    log WARN "$message; consecutive_failures=$count threshold=$HEALTH_FAILURE_THRESHOLD"
+    exit 0
+  fi
+  rm -f "$HEALTH_FAILURE_STATE"
+  fail "$message; consecutive_failures=$count threshold=$HEALTH_FAILURE_THRESHOLD"
+}
+
+clear_data_failures() {
+  rm -f "$HEALTH_FAILURE_STATE"
 }
 
 parse_listen() {
@@ -355,6 +394,7 @@ check_socks_with_python() {
   python3 - "$HEALTH_HOST" "$HEALTH_PORT" "$HEALTH_TIMEOUT" "$target" <<'PY'
 import ipaddress
 import socket
+import ssl
 import sys
 
 proxy_host, proxy_port, timeout, target = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
@@ -418,6 +458,24 @@ with socket.create_connection((proxy_host, proxy_port), timeout=timeout) as sock
     else:
         raise SystemExit(f"unexpected SOCKS5 reply address type: {atyp}")
     recv_exact(sock, 2)
+
+    try:
+        ipaddress.ip_address(target_host)
+        target_is_ip = True
+    except ValueError:
+        target_is_ip = False
+
+    if target_port == 443 and not target_is_ip:
+        context = ssl.create_default_context()
+        with context.wrap_socket(sock, server_hostname=target_host) as tls_sock:
+            tls_sock.settimeout(timeout)
+            request = (
+                f"HEAD / HTTP/1.1\r\nHost: {target_host}\r\n"
+                "Connection: close\r\nUser-Agent: firefox-vpn-healthcheck\r\n\r\n"
+            ).encode("ascii")
+            tls_sock.sendall(request)
+            if not tls_sock.recv(1):
+                raise SystemExit("unexpected EOF during HTTPS data probe")
 PY
 }
 
@@ -463,6 +521,10 @@ case "$service_state" in
     log INFO "$SERVICE_NAME.service is inactive; assuming it was stopped intentionally"
     exit 0
     ;;
+  activating|reloading|deactivating)
+    log INFO "$SERVICE_NAME.service is $service_state; deferring health check"
+    exit 0
+    ;;
   *)
     fail "$SERVICE_NAME.service is $service_state"
     ;;
@@ -478,12 +540,28 @@ if command -v python3 >/dev/null 2>&1; then
     check_status_with_python || fail "status file is stale or unreadable: $STATUS_FILE"
   fi
   IFS=',' read -r -a HEALTH_TARGET_LIST <<< "$HEALTH_TARGETS"
+  health_success=0
+  health_failure=0
+  failed_targets=""
   for target in "${HEALTH_TARGET_LIST[@]}"; do
     target="${target#"${target%%[![:space:]]*}"}"
     target="${target%"${target##*[![:space:]]}"}"
     [[ -n "$target" ]] || continue
-    check_socks_with_python "$target" || fail "SOCKS5 CONNECT health check failed at $HEALTH_HOST:$HEALTH_PORT target=$target"
+    if check_socks_with_python "$target"; then
+      health_success=$((health_success + 1))
+    else
+      health_failure=$((health_failure + 1))
+      failed_targets="${failed_targets:+$failed_targets,}$target"
+      log WARN "SOCKS5 data health check failed at $HEALTH_HOST:$HEALTH_PORT target=$target"
+    fi
   done
+  if (( health_success == 0 )); then
+    record_data_failure "all SOCKS5 data health checks failed at $HEALTH_HOST:$HEALTH_PORT targets=$failed_targets"
+  fi
+  clear_data_failures
+  if (( health_failure > 0 )); then
+    log WARN "SOCKS5 proxy remains healthy because $health_success target(s) succeeded; failed=$failed_targets"
+  fi
 else
   if [[ "$HEALTH_VERBOSE" == "1" || "$HEALTH_VERBOSE" == "true" ]]; then
     log WARN "python3 missing; falling back to local TCP health check without upstream CONNECT"
@@ -492,7 +570,7 @@ else
 fi
 
 if [[ "$HEALTH_VERBOSE" == "1" || "$HEALTH_VERBOSE" == "true" ]]; then
-  log INFO "$SERVICE_NAME healthy at $HEALTH_HOST:$HEALTH_PORT target=$HEALTH_TARGET"
+  log INFO "$SERVICE_NAME healthy at $HEALTH_HOST:$HEALTH_PORT targets=$HEALTH_TARGETS"
 fi
 EOF
   chmod 0755 "$health_script"
@@ -506,7 +584,7 @@ Description=Firefox VPN SOCKS5 proxy
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=300
-StartLimitBurst=20
+StartLimitBurst=40
 
 [Service]
 Type=simple
@@ -519,7 +597,7 @@ Environment=ENV_FILE=$ENV_FILE
 EnvironmentFile=-$ENV_FILE
 ExecStart=$INSTALL_DIR/run.sh
 Restart=always
-RestartSec=5s
+RestartSec=10s
 TimeoutStopSec=20s
 KillSignal=SIGINT
 NoNewPrivileges=true
@@ -633,7 +711,7 @@ login_service_user() {
   write_healthcheck_script
   write_units
 
-  local -a args=(-login -print-info -listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -idle-timeout "$IDLE_TIMEOUT" -max-conns "$MAX_CONNS" -upstream-conns "$UPSTREAM_CONNS" -status-file "$STATUS_FILE")
+  local -a args=(-login -print-info -listen "$LISTEN" -timeout "$TIMEOUT" -handshake-timeout "$HANDSHAKE_TIMEOUT" -idle-timeout "$IDLE_TIMEOUT" -max-conns "$MAX_CONNS" -upstream-conns "$UPSTREAM_CONNS" -status-file "$STATUS_FILE" -proxy-state-file "$PROXY_STATE_FILE")
   if [[ -n "$PROXY" ]]; then
     args+=(-proxy "$PROXY")
   fi
