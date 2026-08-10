@@ -2185,6 +2185,10 @@ func newH3ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (
 	}
 	quicCfg := &quic.Config{
 		KeepAlivePeriod: 30 * time.Second,
+		// Default InitialPacketSize (1280) is the QUIC payload size;
+		// once IP/UDP headers are added it exceeds low-MTU links so every initial packet gets dropped and the handshake times out with no QUIC traffic visible on the wire.
+		// Start below the RFC 8899 floor so the handshake succeeds on any path; PMTU discovery grows it back up.
+		InitialPacketSize: 1200,
 	}
 
 	var perAttempt time.Duration
