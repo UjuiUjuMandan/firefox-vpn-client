@@ -703,6 +703,21 @@ type fakeProxySession struct {
 	token       string
 }
 
+// mortalProxySession is a fake session that can report itself dead, standing in
+// for a session whose keepalive PING has failed.
+type mortalProxySession struct {
+	fakeProxySession
+	alive atomic.Bool
+}
+
+func newMortalProxySession() *mortalProxySession {
+	s := &mortalProxySession{}
+	s.alive.Store(true)
+	return s
+}
+
+func (s *mortalProxySession) IsAlive() bool { return s.alive.Load() }
+
 func (s *fakeProxySession) OpenTunnel(authority string) (net.Conn, error) {
 	s.openCount.Add(1)
 	if s.openErr != nil {
@@ -916,6 +931,87 @@ func TestProxySessionPoolDistributesTunnels(t *testing.T) {
 		if got := session.openCount.Load(); got != 2 {
 			t.Fatalf("expected session %d open count 2, got %d", i, got)
 		}
+	}
+}
+
+func TestProxySessionPoolSkipsAndReplacesDeadSession(t *testing.T) {
+	t.Parallel()
+
+	dead := newMortalProxySession()
+	live := newMortalProxySession()
+	var created atomic.Int32
+	replacement := newMortalProxySession()
+	pool, err := newProxySessionPool(2, func() (proxySession, error) {
+		switch created.Add(1) {
+		case 1:
+			return dead, nil
+		case 2:
+			return live, nil
+		default:
+			return replacement, nil
+		}
+	})
+	if err != nil {
+		t.Fatalf("newProxySessionPool returned error: %v", err)
+	}
+	defer pool.Close()
+
+	// The keepalive notices the first session died while idle.
+	dead.alive.Store(false)
+
+	for i := 0; i < 4; i++ {
+		conn, err := pool.OpenTunnel("example.com:443")
+		if err != nil {
+			t.Fatalf("OpenTunnel %d returned error: %v", i, err)
+		}
+		_ = conn.Close()
+	}
+
+	if got := dead.openCount.Load(); got != 0 {
+		t.Fatalf("expected no tunnels on the dead session, got %d", got)
+	}
+	waitForCondition(t, 2*time.Second, func() bool {
+		return created.Load() >= 3
+	})
+	waitForCondition(t, 2*time.Second, func() bool {
+		return dead.closeCount.Load() == 1
+	})
+}
+
+func TestProxyControllerRebuildsKeepAliveDeadSession(t *testing.T) {
+	t.Parallel()
+
+	dead := newMortalProxySession()
+	fresh := newMortalProxySession()
+	var created atomic.Int32
+	controller := &proxyController{
+		current: &managedSession{
+			session:   dead,
+			expiresAt: time.Now().Add(10 * time.Minute),
+			accepting: true,
+		},
+	}
+	controller.refreshSession = func() error {
+		created.Add(1)
+		controller.swapSession(fresh, time.Now().Add(20*time.Minute))
+		return nil
+	}
+	dead.alive.Store(false)
+
+	conn, err := controller.OpenTunnel("example.com:443")
+	if err != nil {
+		t.Fatalf("OpenTunnel returned error: %v", err)
+	}
+	defer conn.Close()
+
+	if got := dead.openCount.Load(); got != 0 {
+		t.Fatalf("expected no tunnel attempt on the dead session, got %d", got)
+	}
+	if got := fresh.openCount.Load(); got != 1 {
+		t.Fatalf("expected the rebuilt session to serve the tunnel, got %d", got)
+	}
+	if got := created.Load(); got != 1 {
+		t.Fatalf("expected exactly one rebuild, got %d", got)
 	}
 }
 

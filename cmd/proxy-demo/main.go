@@ -61,6 +61,8 @@ const (
 	upstreamSessionRetryDelay     = 10 * time.Second
 	apiProxyDialTimeout           = 20 * time.Second
 	defaultTunnelWriteBufSize     = 1 << 20
+	upstreamKeepAliveInterval     = 10 * time.Second
+	upstreamKeepAlivePingTimeout  = 5 * time.Second
 	copyBufferSize                = 64 * 1024
 	halfCloseDrainTimeout         = 2 * time.Minute
 	maxDistinctOpenTimeoutTargets = 3
@@ -1140,6 +1142,26 @@ type proxySessionTokenUpdater interface {
 	UpdateToken(token string) error
 }
 
+// proxySessionLivenessChecker is implemented by sessions that can report
+// whether their underlying connection is still usable, so a silently dead
+// session is skipped before a client connection is bound to it.
+type proxySessionLivenessChecker interface {
+	IsAlive() bool
+}
+
+// isSessionAlive reports whether session can still carry new tunnels.
+// Sessions that cannot answer are assumed alive, keeping the reactive
+// rebuild path as the fallback.
+func isSessionAlive(session proxySession) bool {
+	if session == nil {
+		return false
+	}
+	if checker, ok := session.(proxySessionLivenessChecker); ok {
+		return checker.IsAlive()
+	}
+	return true
+}
+
 type sessionFailureTracker struct {
 	mu                 sync.Mutex
 	openTimeoutTargets map[string]struct{}
@@ -1346,6 +1368,12 @@ func (p *proxySessionPool) openTunnel(authority, clientKey string) (net.Conn, er
 		}
 		session, ok := pooled.acquire()
 		if !ok {
+			// A slot the keepalive marked unhealthy stays skipped until it is
+			// retired, so retire it here to trigger background replenishment.
+			if pooled.needsRetire() {
+				p.setClientFallback(clientKey, start, slot, (slot+1)%len(p.sessions))
+				p.retireSlot(slot, pooled)
+			}
 			continue
 		}
 		conn, err := session.OpenTunnel(authority)
@@ -1519,8 +1547,22 @@ func (p *pooledProxySession) acquire() (proxySession, bool) {
 	if !p.healthy || p.retired || p.session == nil {
 		return nil, false
 	}
+	if !isSessionAlive(p.session) {
+		// The keepalive already saw this connection die. Mark it unhealthy so
+		// openTunnel retires the slot and replenishes it in the background.
+		p.healthy = false
+		return nil, false
+	}
 	p.refs++
 	return p.session, true
+}
+
+// needsRetire reports whether this slot holds a session that is unusable but
+// has not been retired yet, so the caller can start a replacement.
+func (p *pooledProxySession) needsRetire() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.retired && !p.healthy
 }
 
 func (p *pooledProxySession) release() {
@@ -2085,6 +2127,12 @@ type h2ProxySession struct {
 	health    sessionFailureTracker
 	closeOnce sync.Once
 	closeErr  error
+
+	// alive is cleared once a keepalive PING fails or the session is closed,
+	// so the pool can skip it before binding a client connection to it.
+	alive atomic.Bool
+	// stopKeepAlive stops the keepalive goroutine on Close.
+	stopKeepAlive context.CancelFunc
 }
 
 func newH2ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (*h2ProxySession, error) {
@@ -2120,13 +2168,55 @@ func newH2ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (
 	}
 	logInfo("upstream HTTP/2 session established proxy=%s", proxyHost)
 
-	return &h2ProxySession{
-		raw:       proxyTLS,
-		cc:        cc,
-		proxyHost: proxyHost,
-		token:     token,
-		timeout:   timeout,
-	}, nil
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &h2ProxySession{
+		raw:           proxyTLS,
+		cc:            cc,
+		proxyHost:     proxyHost,
+		token:         token,
+		timeout:       timeout,
+		stopKeepAlive: cancel,
+	}
+	session.alive.Store(true)
+	go session.runKeepAlive(ctx)
+
+	return session, nil
+}
+
+// runKeepAlive pings the upstream connection periodically so a silently
+// dropped session is noticed while idle, rather than when a client next tries
+// to open a tunnel through it.
+func (s *h2ProxySession) runKeepAlive(ctx context.Context) {
+	ticker := time.NewTicker(upstreamKeepAliveInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pingCtx, cancel := context.WithTimeout(ctx, upstreamKeepAlivePingTimeout)
+			err := s.cc.Ping(pingCtx)
+			cancel()
+			if err == nil {
+				continue
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			s.alive.Store(false)
+			logWarn("upstream HTTP/2 keepalive failed proxy=%s err=%s", s.proxyHost, logErr(err))
+			return
+		}
+	}
+}
+
+// IsAlive reports whether this session can still carry new tunnels.
+func (s *h2ProxySession) IsAlive() bool {
+	if !s.alive.Load() {
+		return false
+	}
+	return s.cc.CanTakeNewRequest()
 }
 
 func (s *h2ProxySession) OpenTunnel(authority string) (net.Conn, error) {
@@ -2185,6 +2275,10 @@ func (s *h2ProxySession) UpdateToken(token string) error {
 
 func (s *h2ProxySession) Close() error {
 	s.closeOnce.Do(func() {
+		s.alive.Store(false)
+		if s.stopKeepAlive != nil {
+			s.stopKeepAlive()
+		}
 		if s.cc != nil {
 			s.closeErr = s.cc.Close()
 		}
@@ -2698,6 +2792,13 @@ func (c *proxyController) openTunnel(authority, clientKey string) (net.Conn, err
 			if !errors.Is(err, errNoUsableProxySession) || lastErr == nil {
 				lastErr = err
 			}
+		} else if !isSessionAlive(ms.session) {
+			// The keepalive already saw this session die; rebuild it instead of
+			// spending a request to rediscover that.
+			lastErr = errProxySessionUnhealthy
+			failedSession = ms
+			c.markSessionUnusable(ms)
+			release()
 		} else {
 			var conn net.Conn
 			if affinitySession, ok := ms.session.(clientAffinityTunnelOpener); ok {
