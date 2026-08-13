@@ -27,6 +27,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/proxy"
 	"golang.org/x/term"
 )
 
@@ -58,6 +59,7 @@ const (
 	defaultMaxConnections         = 256
 	defaultUpstreamConnections    = 1
 	upstreamSessionRetryDelay     = 10 * time.Second
+	apiProxyDialTimeout           = 20 * time.Second
 	copyBufferSize                = 64 * 1024
 	halfCloseDrainTimeout         = 2 * time.Minute
 	maxDistinctOpenTimeoutTargets = 3
@@ -153,6 +155,7 @@ func main() {
 		flag.PrintDefaults()
 	}
 
+	apiProxyFlag := flag.String("api-proxy", "", "Optional HTTP/HTTPS/SOCKS5 proxy for Firefox Accounts, Guardian, and Remote Settings API requests")
 	guardianFlag := flag.String("guardian", vpnclient.GuardianEndpointDefault, "Guardian API endpoint")
 	listenFlag := flag.String("listen", "127.0.0.1:1080", "Local SOCKS5 listen address")
 	loginFlag := flag.Bool("login", false, "Force fresh login (ignore saved refresh token)")
@@ -174,6 +177,10 @@ func main() {
 	verboseFlag := flag.Bool("verbose", false, "Enable verbose per-connection logs, including CONNECT target hosts")
 	flag.Parse()
 	verboseLogs = *verboseFlag
+	if err := configureAPIProxy(strings.TrimSpace(*apiProxyFlag)); err != nil {
+		logError("invalid -api-proxy: %s", logErr(err))
+		os.Exit(1)
+	}
 	if *upstreamConnsFlag < 1 {
 		logError("invalid -upstream-conns %d: must be at least 1", *upstreamConnsFlag)
 		os.Exit(1)
@@ -1062,6 +1069,60 @@ func normalizeProxyURL(raw string) (*url.URL, error) {
 		return nil, fmt.Errorf("missing proxy host")
 	}
 	return parsed, nil
+}
+
+// configureAPIProxy routes control plane requests through raw, which may be an
+// http, https, socks5, or socks5h proxy URL. An empty value leaves the default
+// direct transport in place. Only the Firefox Accounts, Guardian, and Remote
+// Settings calls are affected; the SOCKS5 data path keeps talking to the
+// upstream VPN proxy directly.
+func configureAPIProxy(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("missing proxy host")
+	}
+
+	dialer := &net.Dialer{Timeout: apiProxyDialTimeout}
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+
+	switch parsed.Scheme {
+	case "http", "https":
+		transport.Proxy = http.ProxyURL(parsed)
+		transport.DialContext = dialer.DialContext
+	case "socks5", "socks5h":
+		var auth *proxy.Auth
+		if parsed.User != nil {
+			password, _ := parsed.User.Password()
+			auth = &proxy.Auth{User: parsed.User.Username(), Password: password}
+		}
+		socksDialer, err := proxy.SOCKS5("tcp", parsed.Host, auth, dialer)
+		if err != nil {
+			return fmt.Errorf("creating socks5 dialer: %w", err)
+		}
+		contextDialer, ok := socksDialer.(proxy.ContextDialer)
+		if !ok {
+			return fmt.Errorf("socks5 dialer does not support contexts")
+		}
+		transport.DialContext = contextDialer.DialContext
+	default:
+		return fmt.Errorf("unsupported proxy scheme %q (supported: http, https, socks5, socks5h)", parsed.Scheme)
+	}
+
+	vpnclient.SetControlPlaneTransport(transport)
+	logInfo("control plane API requests routed through proxy=%s scheme=%s", parsed.Host, parsed.Scheme)
+	return nil
 }
 
 type tunnelOpener interface {
