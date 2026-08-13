@@ -60,6 +60,7 @@ const (
 	defaultUpstreamConnections    = 1
 	upstreamSessionRetryDelay     = 10 * time.Second
 	apiProxyDialTimeout           = 20 * time.Second
+	defaultTunnelWriteBufSize     = 1 << 20
 	copyBufferSize                = 64 * 1024
 	halfCloseDrainTimeout         = 2 * time.Minute
 	maxDistinctOpenTimeoutTargets = 3
@@ -2129,9 +2130,9 @@ func newH2ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (
 }
 
 func (s *h2ProxySession) OpenTunnel(authority string) (net.Conn, error) {
-	pr, pw := io.Pipe()
+	reqBody := newTunnelWriteBuffer(defaultTunnelWriteBufSize)
 	resp, cancel, err := roundTripWithOpenTimeout(s.timeout, func(ctx context.Context) (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "http://"+authority, pr)
+		req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "http://"+authority, reqBody)
 		if err != nil {
 			return nil, err
 		}
@@ -2141,16 +2142,14 @@ func (s *h2ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 		return s.cc.RoundTrip(req)
 	})
 	if err != nil {
-		_ = pr.Close()
-		_ = pw.Close()
+		reqBody.failRead(io.ErrClosedPipe)
 		return nil, s.health.observe(authority, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		cancel()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		_ = resp.Body.Close()
-		_ = pr.Close()
-		_ = pw.Close()
+		reqBody.failRead(io.ErrClosedPipe)
 		return nil, s.health.observe(authority, &proxyConnectHTTPError{
 			statusCode: resp.StatusCode,
 			status:     resp.Status,
@@ -2161,8 +2160,8 @@ func (s *h2ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 
 	return &tunnelConn{
 		reader:  resp.Body,
-		writer:  pw,
-		reqBody: pr,
+		writer:  reqBody,
+		reqBody: reqBody,
 		name:    "h2-connect-stream",
 		cancel:  cancel,
 	}, nil
@@ -2316,9 +2315,9 @@ func newH3ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (
 }
 
 func (s *h3ProxySession) OpenTunnel(authority string) (net.Conn, error) {
-	pr, pw := io.Pipe()
+	reqBody := newTunnelWriteBuffer(defaultTunnelWriteBufSize)
 	resp, cancel, err := roundTripWithOpenTimeout(s.timeout, func(ctx context.Context) (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "https://"+authority, pr)
+		req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "https://"+authority, reqBody)
 		if err != nil {
 			return nil, err
 		}
@@ -2328,16 +2327,14 @@ func (s *h3ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 		return s.rt.RoundTrip(req)
 	})
 	if err != nil {
-		_ = pr.Close()
-		_ = pw.Close()
+		reqBody.failRead(io.ErrClosedPipe)
 		return nil, s.health.observe(authority, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		cancel()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		_ = resp.Body.Close()
-		_ = pr.Close()
-		_ = pw.Close()
+		reqBody.failRead(io.ErrClosedPipe)
 		return nil, s.health.observe(authority, &proxyConnectHTTPError{
 			statusCode: resp.StatusCode,
 			status:     resp.Status,
@@ -2348,8 +2345,8 @@ func (s *h3ProxySession) OpenTunnel(authority string) (net.Conn, error) {
 
 	return &tunnelConn{
 		reader:  resp.Body,
-		writer:  pw,
-		reqBody: pr,
+		writer:  reqBody,
+		reqBody: reqBody,
 		name:    "h3-connect-stream",
 		cancel:  cancel,
 	}, nil
@@ -2388,10 +2385,127 @@ func (s *h3ProxySession) Close() error {
 	return s.closeErr
 }
 
+// tunnelWriteBuffer is a bounded, concurrency-safe ring buffer used as the
+// request body of a CONNECT tunnel. It replaces io.Pipe, whose every write
+// blocks until a reader consumes it: here a writer can run ahead of the HTTP
+// transport by up to the buffer size, which keeps upload throughput from being
+// bounded by a goroutine hand-off per write.
+type tunnelWriteBuffer struct {
+	mu       sync.Mutex
+	notEmpty *sync.Cond
+	notFull  *sync.Cond
+	buf      []byte
+	n        int
+	off      int
+	closed   bool
+	readErr  error
+}
+
+func newTunnelWriteBuffer(size int) *tunnelWriteBuffer {
+	if size < 1 {
+		size = defaultTunnelWriteBufSize
+	}
+	b := &tunnelWriteBuffer{buf: make([]byte, size)}
+	b.notEmpty = sync.NewCond(&b.mu)
+	b.notFull = sync.NewCond(&b.mu)
+	return b
+}
+
+// Read drains buffered data, blocking while the buffer is empty and still
+// open. A read that reaches the end of the ring returns a short read rather
+// than wrapping, which io.Reader permits.
+func (b *tunnelWriteBuffer) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for b.n == 0 && b.readErr == nil && !b.closed {
+		b.notEmpty.Wait()
+	}
+	if b.n == 0 {
+		if b.readErr != nil {
+			return 0, b.readErr
+		}
+		return 0, io.EOF
+	}
+
+	end := b.off + b.n
+	if end > len(b.buf) {
+		end = len(b.buf)
+	}
+	n := copy(p, b.buf[b.off:end])
+	b.off = (b.off + n) % len(b.buf)
+	b.n -= n
+	b.notFull.Broadcast()
+	return n, nil
+}
+
+// Write blocks only while the buffer is full, so bursts smaller than the
+// buffer complete without waiting for the reader.
+func (b *tunnelWriteBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	total := 0
+	for len(p) > 0 {
+		for b.n == len(b.buf) && b.readErr == nil && !b.closed {
+			b.notFull.Wait()
+		}
+		if b.readErr != nil {
+			return total, b.readErr
+		}
+		if b.closed {
+			return total, io.ErrClosedPipe
+		}
+
+		space := len(b.buf) - b.n
+		head := (b.off + b.n) % len(b.buf)
+		writable := len(b.buf) - head
+		if space < writable {
+			writable = space
+		}
+		if writable > len(p) {
+			writable = len(p)
+		}
+		copy(b.buf[head:], p[:writable])
+		b.n += writable
+		p = p[writable:]
+		total += writable
+		b.notEmpty.Broadcast()
+	}
+	return total, nil
+}
+
+// Close signals end of stream. Buffered data stays readable so a half-closed
+// tunnel still flushes what the client already wrote.
+func (b *tunnelWriteBuffer) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil
+	}
+	b.closed = true
+	b.notEmpty.Broadcast()
+	b.notFull.Broadcast()
+	return nil
+}
+
+// failRead makes pending and future reads fail with err, unblocking the HTTP/2
+// request body writer when the tunnel is torn down.
+func (b *tunnelWriteBuffer) failRead(err error) {
+	b.mu.Lock()
+	if b.readErr == nil {
+		b.readErr = err
+	}
+	b.closed = true
+	b.notEmpty.Broadcast()
+	b.notFull.Broadcast()
+	b.mu.Unlock()
+}
+
 type tunnelConn struct {
 	reader  io.ReadCloser
-	writer  *io.PipeWriter
-	reqBody *io.PipeReader
+	writer  *tunnelWriteBuffer
+	reqBody *tunnelWriteBuffer
 	cancel  context.CancelFunc
 	name    tunnelAddr
 
@@ -2414,10 +2528,12 @@ func (c *tunnelConn) Write(p []byte) (int, error) {
 func (c *tunnelConn) Close() error {
 	c.closeOnce.Do(func() {
 		writeErr := c.CloseWrite()
-		if c.reqBody != nil {
-			_ = c.reqBody.Close()
-		}
 		readErr := c.CloseRead()
+		if c.reqBody != nil {
+			// Unblock the transport if it is still reading the request body,
+			// and discard anything the client wrote but never got flushed.
+			c.reqBody.failRead(io.ErrClosedPipe)
+		}
 		if c.cancel != nil {
 			c.cancel()
 		}
