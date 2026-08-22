@@ -993,7 +993,7 @@ func TestProxyControllerRebuildsKeepAliveDeadSession(t *testing.T) {
 	}
 	controller.refreshSession = func() error {
 		created.Add(1)
-		controller.swapSession(fresh, time.Now().Add(20*time.Minute))
+		controller.swapSession(fresh, "fresh-token", time.Now().Add(20*time.Minute))
 		return nil
 	}
 	dead.alive.Store(false)
@@ -1596,7 +1596,7 @@ func TestProxyControllerSwapDrainsOldSession(t *testing.T) {
 		t.Fatalf("expected old session open count 1, got %d", oldSession.openCount.Load())
 	}
 
-	controller.swapSession(newSession, time.Now().Add(20*time.Minute))
+	controller.swapSession(newSession, "new-token", time.Now().Add(20*time.Minute))
 
 	conn2, err := controller.OpenTunnel("example.org:443")
 	if err != nil {
@@ -1656,7 +1656,7 @@ func TestProxyControllerRejectsSessionSwapAfterClose(t *testing.T) {
 
 	controller := &proxyController{closed: true}
 	newSession := &fakeProxySession{}
-	if controller.swapSession(newSession, time.Now().Add(time.Minute)) {
+	if controller.swapSession(newSession, "new-token", time.Now().Add(time.Minute)) {
 		t.Fatal("expected closed controller to reject session swap")
 	}
 	if got := newSession.closeCount.Load(); got != 1 {
@@ -1713,7 +1713,7 @@ func TestProxyControllerRebuildsSessionAfterOpenTunnelFailure(t *testing.T) {
 		},
 	}
 	controller.refreshSession = func() error {
-		controller.swapSession(newSession, time.Now().Add(20*time.Minute))
+		controller.swapSession(newSession, "new-token", time.Now().Add(20*time.Minute))
 		return nil
 	}
 
@@ -1791,6 +1791,7 @@ func TestProxyControllerStopsAfterThreeOpenTunnelRebuilds(t *testing.T) {
 		n := rebuilds.Add(1)
 		controller.swapSession(
 			&fakeProxySession{openErr: fmt.Errorf("rebuilt session %d failed", n)},
+			fmt.Sprintf("rebuilt-token-%d", n),
 			time.Now().Add(20*time.Minute),
 		)
 		return nil
@@ -1846,7 +1847,7 @@ func TestProxyControllerSkipsRebuildWhenSessionAlreadyReplaced(t *testing.T) {
 		},
 	}
 	failed := controller.current
-	controller.swapSession(newSession, time.Now().Add(20*time.Minute))
+	controller.swapSession(newSession, "new-token", time.Now().Add(20*time.Minute))
 
 	var rebuilds atomic.Int32
 	controller.refreshSession = func() error {
@@ -1953,5 +1954,140 @@ func TestProxyControllerRenewWithTimeoutStopsWhenClosed(t *testing.T) {
 	_, timedOut := controller.renewWithTimeout(time.Hour)
 	if timedOut {
 		t.Fatal("expected closed controller not to report renewal timeout")
+	}
+}
+
+func TestLoadSessionTokenPool(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "tokens.txt")
+	content := "token-a\r\n\n# comment line\ntoken-b\n   token-a   \ntoken-c\n"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatalf("writing token file: %v", err)
+	}
+
+	pool, err := loadSessionTokenPool(path)
+	if err != nil {
+		t.Fatalf("loadSessionTokenPool returned error: %v", err)
+	}
+	if pool.size() != 3 {
+		t.Fatalf("expected 3 tokens (duplicates skipped), got %d", pool.size())
+	}
+
+	want := []string{"token-a", "token-b", "token-c"}
+	for i, expected := range want {
+		token, index, total, ok := pool.next()
+		if !ok {
+			t.Fatalf("pool exhausted early at position %d", i)
+		}
+		if token != expected {
+			t.Fatalf("expected token %q at position %d, got %q", expected, i, token)
+		}
+		if index != i+1 || total != len(want) {
+			t.Fatalf("expected position %d/%d, got %d/%d", i+1, len(want), index, total)
+		}
+	}
+	if _, _, _, ok := pool.next(); ok {
+		t.Fatal("expected pool to be exhausted after all tokens consumed")
+	}
+}
+
+func TestLoadSessionTokenPoolRejectsEmptyFile(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "tokens.txt")
+	if err := os.WriteFile(path, []byte("# only comments\n\n"), 0600); err != nil {
+		t.Fatalf("writing token file: %v", err)
+	}
+	if _, err := loadSessionTokenPool(path); err == nil {
+		t.Fatal("expected error for file without tokens")
+	}
+}
+
+func TestIsQuotaExhausted(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		pass *vpnclient.ProxyPassInfo
+		want bool
+	}{
+		{"nil pass", nil, false},
+		{"no quota headers", &vpnclient.ProxyPassInfo{}, false},
+		{"zero remaining", &vpnclient.ProxyPassInfo{QuotaLeft: "0"}, true},
+		{"quota remaining", &vpnclient.ProxyPassInfo{QuotaLeft: "1073741824"}, false},
+		{"unparsable value", &vpnclient.ProxyPassInfo{QuotaLeft: "n/a"}, false},
+	}
+	for _, tc := range cases {
+		if got := isQuotaExhausted(tc.pass); got != tc.want {
+			t.Errorf("%s: expected %v, got %v", tc.name, tc.want, got)
+		}
+	}
+}
+
+func TestSessionTokenPoolPersistsActivationState(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tokens.txt")
+	if err := os.WriteFile(path, []byte("token-a\ntoken-b\ntoken-c\n"), 0600); err != nil {
+		t.Fatalf("writing token file: %v", err)
+	}
+
+	pool, err := loadSessionTokenPool(path)
+	if err != nil {
+		t.Fatalf("loadSessionTokenPool returned error: %v", err)
+	}
+	if pool.resumedIndex() != 0 {
+		t.Fatalf("expected no resumed token on first load, got %d", pool.resumedIndex())
+	}
+	pool.saveState(2) // token-b was the last activated
+
+	if _, err := os.Stat(path + ".state"); err != nil {
+		t.Fatalf("state file was not created: %v", err)
+	}
+	if _, err := os.Stat(path + ".state.tmp"); !os.IsNotExist(err) {
+		t.Fatalf("temp state file left behind after atomic write (err=%v)", err)
+	}
+
+	resumed, err := loadSessionTokenPool(path)
+	if err != nil {
+		t.Fatalf("reloading pool returned error: %v", err)
+	}
+	if resumed.resumedIndex() != 2 {
+		t.Fatalf("expected resumed index 2, got %d", resumed.resumedIndex())
+	}
+	token, index, _, ok := resumed.next()
+	if !ok || token != "token-b" || index != 2 {
+		t.Fatalf("expected resumed next token token-b at 2, got %q at %d (ok=%v)", token, index, ok)
+	}
+}
+
+func TestSessionTokenPoolDiscardsStateWhenFileChanges(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tokens.txt")
+	if err := os.WriteFile(path, []byte("token-a\ntoken-b\n"), 0600); err != nil {
+		t.Fatalf("writing token file: %v", err)
+	}
+	pool, err := loadSessionTokenPool(path)
+	if err != nil {
+		t.Fatalf("loadSessionTokenPool returned error: %v", err)
+	}
+	pool.saveState(2)
+
+	if err := os.WriteFile(path, []byte("token-a\ntoken-b\ntoken-c\n"), 0600); err != nil {
+		t.Fatalf("rewriting token file: %v", err)
+	}
+	reloaded, err := loadSessionTokenPool(path)
+	if err != nil {
+		t.Fatalf("reloading pool returned error: %v", err)
+	}
+	if reloaded.resumedIndex() != 0 {
+		t.Fatalf("expected state to be discarded after file change, got resumed index %d", reloaded.resumedIndex())
+	}
+	if token, _, _, _ := reloaded.next(); token != "token-a" {
+		t.Fatalf("expected first token after file change, got %q", token)
 	}
 }

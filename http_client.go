@@ -1,8 +1,10 @@
 package vpnclient
 
 import (
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"time"
 )
 
@@ -11,9 +13,22 @@ const (
 	errorBodyLogLimit       = 16 * 1024
 )
 
-var controlPlaneHTTPClient = &http.Client{
-	Timeout: controlPlaneHTTPTimeout,
-}
+// controlPlaneHTTPClient is the isolated HTTP client for all API requests
+// (FxA, Guardian, Remote Settings). It carries an explicit timeout so
+// requests can never hang indefinitely; SetControlPlaneTransport may replace
+// its Transport. It is deliberately kept separate from http.DefaultClient.
+// The cookie jar holds Fastly anti-bot challenge cookies earned by
+// solveFastlyChallenge.
+var controlPlaneHTTPClient = func() *http.Client {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		panic(fmt.Sprintf("creating control plane cookie jar: %v", err))
+	}
+	return &http.Client{
+		Timeout: controlPlaneHTTPTimeout,
+		Jar:     jar,
+	}
+}()
 
 // SetControlPlaneTransport routes Firefox Accounts, Guardian, and Remote
 // Settings requests through transport. It must be called before any control
@@ -24,10 +39,6 @@ func SetControlPlaneTransport(transport http.RoundTripper) {
 
 func doControlPlane(req *http.Request) (*http.Response, error) {
 	return controlPlaneHTTPClient.Do(req)
-}
-
-func getControlPlane(rawURL string) (*http.Response, error) {
-	return controlPlaneHTTPClient.Get(rawURL)
 }
 
 func readErrorBody(r io.Reader) string {

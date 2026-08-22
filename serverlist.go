@@ -1,6 +1,7 @@
 package vpnclient
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,8 +48,14 @@ type remoteSettingsResponse struct {
 	Data []json.RawMessage `json:"data"`
 }
 
-func fetchServerList() ([]Country, error) {
-	resp, err := getControlPlane(remoteSettingsURL)
+func fetchServerList(ctx context.Context) ([]Country, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, remoteSettingsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	applyMozillaVPNHeaders(req)
+
+	resp, err := doControlPlane(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching server list: %w", err)
 	}
@@ -117,8 +124,8 @@ func printServerList(countries []Country) {
 	}
 }
 
-func FetchServerList() ([]Country, error) {
-	return fetchServerList()
+func FetchServerList(ctx context.Context) ([]Country, error) {
+	return fetchServerList(ctx)
 }
 
 func PrintServerList(countries []Country) {

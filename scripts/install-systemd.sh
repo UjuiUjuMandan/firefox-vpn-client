@@ -17,6 +17,7 @@ CONFIG_KEYS=(
   PROXY
   COUNTRY
   PROXY_STATE_FILE
+  SESSION_TOKEN
   GUARDIAN
   TIMEOUT
   HANDSHAKE_TIMEOUT
@@ -51,6 +52,7 @@ LISTEN="${LISTEN:-127.0.0.1:1080}"
 PROXY="${PROXY:-}"
 COUNTRY="${COUNTRY:-}"
 PROXY_STATE_FILE="${PROXY_STATE_FILE:-$STATE_DIR/proxy-selection.json}"
+SESSION_TOKEN="${SESSION_TOKEN:-}"
 GUARDIAN="${GUARDIAN:-}"
 TIMEOUT="${TIMEOUT:-20s}"
 HANDSHAKE_TIMEOUT="${HANDSHAKE_TIMEOUT:-10s}"
@@ -237,6 +239,7 @@ write_env_file() {
     write_env_var PROXY "$PROXY"
     write_env_var COUNTRY "$COUNTRY"
     write_env_var PROXY_STATE_FILE "$PROXY_STATE_FILE"
+    write_env_var SESSION_TOKEN "$SESSION_TOKEN"
     write_env_var GUARDIAN "$GUARDIAN"
     write_env_var TIMEOUT "$TIMEOUT"
     write_env_var HANDSHAKE_TIMEOUT "$HANDSHAKE_TIMEOUT"
@@ -286,6 +289,7 @@ UPSTREAM_CONNS="${UPSTREAM_CONNS:-1}"
 IDLE_TIMEOUT="${IDLE_TIMEOUT:-0}"
 STATUS_FILE="${STATUS_FILE:-}"
 PROXY_STATE_FILE="${PROXY_STATE_FILE:-}"
+SESSION_TOKEN="${SESSION_TOKEN:-}"
 COUNTRY="${COUNTRY:-}"
 VERIFY_EXIT="${VERIFY_EXIT:-1}"
 EXIT_CHECK_URL="${EXIT_CHECK_URL:-https://www.cloudflare.com/cdn-cgi/trace}"
@@ -297,6 +301,11 @@ if [[ -n "${PROXY:-}" ]]; then
   args+=(-proxy "$PROXY")
 elif [[ -n "$COUNTRY" ]]; then
   args+=(-country "$COUNTRY")
+fi
+if [[ -n "${SESSION_TOKEN:-}" ]]; then
+  # May be a single session token or a path to a token pool file (one
+  # token per line; the file must be readable by the service user).
+  args+=(-session-token "$SESSION_TOKEN")
 fi
 if [[ -n "${GUARDIAN:-}" ]]; then
   args+=(-guardian "$GUARDIAN")

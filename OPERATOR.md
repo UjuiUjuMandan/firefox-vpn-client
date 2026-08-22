@@ -4,10 +4,12 @@
 
 ## 基本能力
 
-- 登录 Firefox Account，获取 OAuth token 和 Guardian proxy pass。
+- 登录 Firefox Account，获取 OAuth token 和 Guardian proxy pass；未验证的登录会要求输入邮件验证码（或打开确认链接）。
 - 本地暴露 SOCKS5 CONNECT 代理。
 - 上游使用 HTTP/2 或 HTTP/3 CONNECT session；高并发时可开启上游 session 池。
 - proxy pass 后台续期时优先原地更新 session token，避免周期性更换出口；session 确认损坏时才重建并重试。
+- 支持会话 token 池：`-session-token` 指向每行一个 token 的 `.txt` 文件，配额耗尽（HTTP 429 或剩余为 0）或 token 被拒时自动切换下一个，激活进度持久化在同名 `.state` 文件。
+- FxA API 请求遇到 Fastly 反爬挑战（HTTP 406）时自动完成 PoW/PAT 挑战并携带通过后的 cookie 重试。
 - Linux 可通过 systemd 常驻运行，附带健康检查和自动重启。
 
 ## 手动运行
@@ -17,6 +19,8 @@
 ```bash
 go run ./cmd/proxy-demo -login -print-info
 ```
+
+登录过程若被要求二次确认，程序会提示输入发送到账号邮箱的验证码（或打开邮件中的确认链接后按回车），验证通过后继续。
 
 启动本地 SOCKS5：
 
@@ -40,9 +44,14 @@ go run ./cmd/proxy-demo -country US -listen 127.0.0.1:1088
 -idle-timeout 0               # 已建立隧道的空闲超时，0 表示关闭限制
 -max-conns 256                # 最大并发客户端连接数，0 表示关闭限制
 -upstream-conns 1             # 上游 proxy session 数量；单用户/sing-box 建议保持 1
+-session-token PATH_OR_TOKEN  # 单个 session token，或每行一个 token 的 .txt 文件（token 池）
 -status-file PATH             # 写入运行状态，systemd 健康检查用来判断 proxy pass 是否过期
 -verbose                      # 打印完整 CONNECT 目标，默认会打码
 ```
+
+### 会话 token 池
+
+`-session-token` 指向文本文件时启用 token 池：每行一个 session token，空行和 `#` 注释忽略，重复 token 去重。当前 token 的月度配额耗尽（HTTP 429 或 `X-Quota-Remaining` 为 0）或被 Guardian 拒绝（HTTP 401/403 且刷新/激活均无效）时，程序自动激活下一个 token 并重建上游 session；每 15 分钟轮询一次配额，不必等 proxy pass 过期。激活进度保存在 `<文件名>.state`（与 token 文件的 sha256 绑定，文件变更后从头开始），重启后从上次用到的 token 继续。池耗尽时报错退出，需等待月度配额重置或补充新 token 文件。
 
 启动后会分别记录配置位置、上游 session 建连耗时和真实出口探测：
 
@@ -120,6 +129,7 @@ LISTEN=127.0.0.1:1088
 PROXY=
 COUNTRY=US
 PROXY_STATE_FILE=/var/lib/firefox-vpn-client/proxy-selection.json
+SESSION_TOKEN=
 TIMEOUT=20s
 HANDSHAKE_TIMEOUT=10s
 IDLE_TIMEOUT=0
@@ -141,6 +151,16 @@ HEALTH_STATUS_GRACE=30
 STATUS_FILE=/var/lib/firefox-vpn-client/status.json
 EXTRA_ARGS=
 ```
+
+`SESSION_TOKEN` 可设为单个 token 或 token 池文件路径。systemd 下 token 池文件应放在服务用户可读的位置，例如：
+
+```bash
+sudo install -o firefox-vpn -g firefox-vpn -m 0600 /path/tokens.txt /var/lib/firefox-vpn-client/session-tokens.txt
+sudoedit /etc/default/firefox-vpn-client   # 设置 SESSION_TOKEN=/var/lib/firefox-vpn-client/session-tokens.txt
+sudo systemctl restart firefox-vpn-client.service
+```
+
+轮换进度写在同目录的 `session-tokens.txt.state`。
 
 ## 性能调优
 
@@ -232,7 +252,15 @@ target=<redacted; use -verbose>
 
 `guardian returned HTTP 403`
 
-程序会尝试自动激活 Guardian；如果仍失败，先确认账号在 Firefox 浏览器内的 VPN 能正常开启。
+程序会尝试自动激活 Guardian；如果仍失败，先确认账号在 Firefox 浏览器内的 VPN 能正常开启。使用 token 池时 token 被拒同样会触发自动轮换。
+
+`Fastly anti-bot challenge ...` / HTTP 406
+
+FxA API 被边缘反爬拦截。程序会自动解挑战（最多 5 次），失败通常因为出口 IP 轮换导致 cookie 失效——配合 `-api-proxy` 使用固定出口的控制代理可缓解。
+
+`no session tokens left in the pool`
+
+token 池已耗尽，需等待月度配额重置，或向 token 文件追加新 token（文件变更后 `.state` 自动失效，会从第一个 token 重新开始）。
 
 `no refresh token available for background renewal`
 
@@ -303,6 +331,6 @@ sudo PURGE=1 ./scripts/install-systemd.sh uninstall
 ## 注意事项
 
 - 不要把监听地址暴露到公网；默认使用 `127.0.0.1`。
-- token 文件等同长期登录凭据，权限应保持 `0600`。
+- token 文件等同长期登录凭据，权限应保持 `0600`；token 池文件同理。
 - `-verbose` 会暴露访问目标，生产环境谨慎开启。
 - 这个项目依赖 Mozilla 相关接口行为，接口或服务策略变化时可能需要跟进修复。

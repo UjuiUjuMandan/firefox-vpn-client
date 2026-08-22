@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -70,6 +72,17 @@ const (
 	defaultExitCheckTimeout       = 10 * time.Second
 	maxExitCheckResponseSize      = 64 * 1024
 	defaultExitCheckURL           = "https://www.cloudflare.com/cdn-cgi/trace"
+
+	// apiRequestTimeout bounds a single control plane API call (FxA,
+	// Guardian, Remote Settings); the shared client adds its own safety
+	// timeout on top, and FxA calls extend it while solving the Fastly
+	// anti-bot challenge.
+	apiRequestTimeout = 15 * time.Second
+
+	// quotaCheckInterval is how often the token pool's remaining monthly
+	// quota is polled so rotation happens as soon as a token is exhausted,
+	// without waiting for the proxy pass itself to expire.
+	quotaCheckInterval = 15 * time.Minute
 )
 
 var (
@@ -78,6 +91,7 @@ var (
 	errProxySessionUnhealthy = errors.New("upstream proxy session became unhealthy")
 	errNoUsableProxySession  = errors.New("no usable upstream proxy session")
 	errTunnelDeadline        = errors.New("deadlines are not supported for HTTP CONNECT tunnel streams")
+	errTokenPoolExhausted    = errors.New("no session tokens left in the pool; wait for the monthly quota reset or provide a new token file")
 	verboseLogs              bool
 	logMu                    sync.Mutex
 )
@@ -162,7 +176,7 @@ func main() {
 	guardianFlag := flag.String("guardian", vpnclient.GuardianEndpointDefault, "Guardian API endpoint")
 	listenFlag := flag.String("listen", "127.0.0.1:1080", "Local SOCKS5 listen address")
 	loginFlag := flag.Bool("login", false, "Force fresh login (ignore saved refresh token)")
-	sessionTokenFlag := flag.String("session-token", "", "Use existing session token directly")
+	sessionTokenFlag := flag.String("session-token", "", "Session token, or path to a .txt file with one token per line; tokens rotate automatically when their monthly quota runs out")
 	printInfoFlag := flag.Bool("print-info", false, "Print user info, quota info, and server list, then exit")
 	proxyFlag := flag.String("proxy", "", "Exact upstream proxy URL or host:port; mutually exclusive with -country")
 	countryFlag := flag.String("country", "", "Mozilla VPN location country code or name used when selecting an upstream proxy")
@@ -212,7 +226,7 @@ func main() {
 		hasPersistedProxy = persistedErr == nil
 	}
 	needServerList := *printInfoFlag || (proxyFlagValue == "" && (!hasPersistedProxy || !proxyCandidateMatchesCountry(persistedProxy, countryFlagValue)))
-	runtimeAuth, tokenSource, countries := prepareDemoInputs(
+	runtimeAuth, tokenSource, countries, tokenPool := prepareDemoInputs(
 		*loginFlag,
 		strings.TrimSpace(*sessionTokenFlag),
 		needServerList,
@@ -244,33 +258,18 @@ func main() {
 		}
 	}
 
-	pass, err := vpnclient.FetchProxyPass(*guardianFlag, runtimeAuth.Token.AccessToken)
-	if guardianStatusCode(err) == http.StatusUnauthorized {
-		logInfo("cached OAuth access was rejected by Guardian; refreshing token")
-		refreshedAuth, refreshErr := refreshRuntimeAuth(runtimeAuth)
-		if refreshErr != nil {
-			logError("refreshing OAuth token after Guardian rejection failed: %v", refreshErr)
-			os.Exit(1)
+	initialAuth := runtimeAuth
+	pass, runtimeAuth, err := acquireInitialPass(*guardianFlag, runtimeAuth, tokenPool)
+	if err == nil && runtimeAuth != initialAuth {
+		if tokenPool != nil {
+			tokenSource = "session token pool rotation"
+		} else {
+			tokenSource = "refresh token after Guardian rejection"
 		}
-		runtimeAuth = refreshedAuth
-		tokenSource = "refresh token after Guardian rejection"
-		pass, err = vpnclient.FetchProxyPass(*guardianFlag, runtimeAuth.Token.AccessToken)
 	}
 	if err != nil {
-		var guardianErr *vpnclient.GuardianHTTPError
-		if errors.As(err, &guardianErr) && guardianErr.StatusCode == http.StatusForbidden {
-			logInfo("Guardian account is not activated for Firefox VPN proxy access; activating")
-			if _, activateErr := vpnclient.ActivateGuardian(*guardianFlag, runtimeAuth.Token.AccessToken); activateErr != nil {
-				logError("activating Guardian account failed: %v", activateErr)
-				os.Exit(1)
-			}
-			logInfo("Guardian account activated")
-			pass, err = vpnclient.FetchProxyPass(*guardianFlag, runtimeAuth.Token.AccessToken)
-		}
-		if err != nil {
-			logError("fetching proxy pass failed: %v", err)
-			os.Exit(1)
-		}
+		logError("fetching proxy pass failed: %v", err)
+		os.Exit(1)
 	}
 	logProxyPassTimeCorrection(pass)
 	if *printInfoFlag {
@@ -288,6 +287,7 @@ func main() {
 		UseH3:      *useH3Flag,
 		Sessions:   *upstreamConnsFlag,
 		StatusFile: strings.TrimSpace(*statusFileFlag),
+		TokenPool:  tokenPool,
 	})
 	if err != nil {
 		if selectedFromState && proxyStateFile != "" {
@@ -318,6 +318,10 @@ func main() {
 	}
 	defer controller.Close()
 	go controller.runRenewalLoop()
+	if tokenPool != nil {
+		go controller.runQuotaMonitorLoop(quotaCheckInterval)
+		logInfo("token rotation enabled tokens=%d quota_check_interval=%s", tokenPool.size(), quotaCheckInterval)
+	}
 
 	ln, err := net.Listen("tcp", *listenFlag)
 	if err != nil {
@@ -544,19 +548,20 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func guardianStatusCode(err error) int {
-	var guardianErr *vpnclient.GuardianHTTPError
-	if errors.As(err, &guardianErr) {
-		return guardianErr.StatusCode
-	}
-	return 0
+func fetchProxyPassCtx(guardian, accessToken string) (*vpnclient.ProxyPassInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+	pass, err := vpnclient.FetchProxyPass(ctx, guardian, accessToken)
+	cancel()
+	return pass, err
 }
 
 func refreshRuntimeAuth(auth *runtimeAuth) (*runtimeAuth, error) {
 	if auth == nil || auth.Token == nil || auth.Token.RefreshToken == "" {
 		return nil, fmt.Errorf("no refresh token available")
 	}
-	token, err := vpnclient.FxaRefreshToken(auth.Token.RefreshToken)
+	ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+	token, err := vpnclient.FxaRefreshToken(ctx, auth.Token.RefreshToken)
+	cancel()
 	if err != nil {
 		return nil, err
 	}
@@ -566,24 +571,46 @@ func refreshRuntimeAuth(auth *runtimeAuth) (*runtimeAuth, error) {
 	return &runtimeAuth{Token: token, ObtainedAt: time.Now()}, nil
 }
 
-func prepareDemoInputs(forceLogin bool, sessionToken string, needServerList bool) (*runtimeAuth, string, []vpnclient.Country) {
-
+func prepareDemoInputs(forceLogin bool, sessionToken string, needServerList bool) (*runtimeAuth, string, []vpnclient.Country, *sessionTokenPool) {
 	var token *vpnclient.TokenResponse
 	var tokenSource string
 	var tokenObtainedAt time.Time
+	var tokenPool *sessionTokenPool
 
-	if sessionToken != "" {
-		fmt.Print("Using provided session token... ")
+	switch {
+	case sessionToken != "" && isExistingFile(sessionToken):
 		var err error
-		token, err = vpnclient.FxaOAuthToken(sessionToken)
+		tokenPool, err = loadSessionTokenPool(sessionToken)
+		if err != nil {
+			logError("loading session token file failed: %v", err)
+			os.Exit(1)
+		}
+		logInfo("loaded session tokens file=%s tokens=%d", sessionToken, tokenPool.size())
+		if from := tokenPool.resumedIndex(); from > 0 {
+			logInfo("resuming from session token %d/%d (saved state)", from, tokenPool.size())
+		}
+		auth, err := activateNextPoolToken(tokenPool)
+		if err != nil {
+			logError("activating session token failed: %v", err)
+			os.Exit(1)
+		}
+		token = auth.Token
+		tokenObtainedAt = auth.ObtainedAt
+		tokenSource = fmt.Sprintf("session-token file %s (%d tokens)", sessionToken, tokenPool.size())
+	case sessionToken != "":
+		fmt.Print("Using provided session token... ")
+		ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+		newToken, err := vpnclient.FxaOAuthToken(ctx, sessionToken)
+		cancel()
 		if err != nil {
 			fmt.Printf("failed: %v\n", err)
 			os.Exit(1)
 		}
+		token = newToken
 		fmt.Println("OK")
 		tokenSource = "session-token flag"
 		tokenObtainedAt = time.Now()
-	} else {
+	default:
 		token, tokenSource, tokenObtainedAt = obtainOAuthToken(forceLogin)
 	}
 
@@ -596,7 +623,9 @@ func prepareDemoInputs(forceLogin bool, sessionToken string, needServerList bool
 	var countries []vpnclient.Country
 	var err error
 	if needServerList {
-		countries, err = vpnclient.FetchServerList()
+		ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+		countries, err = vpnclient.FetchServerList(ctx)
+		cancel()
 		if err != nil {
 			logWarn("fetching server list failed: %v", err)
 		}
@@ -605,12 +634,246 @@ func prepareDemoInputs(forceLogin bool, sessionToken string, needServerList bool
 	return &runtimeAuth{
 		Token:      token,
 		ObtainedAt: tokenObtainedAt,
-	}, tokenSource, countries
+	}, tokenSource, countries, tokenPool
+}
+
+// sessionTokenPool holds session tokens loaded from a text file and hands
+// them out one by one as the previous token's monthly quota is exhausted.
+type sessionTokenPool struct {
+	mu      sync.Mutex
+	tokens  []string
+	nextIdx int
+
+	statePath   string // persists activation progress next to the token file
+	checksum    string // sha256 of the token file; state is discarded if it differs
+	resumedFrom int    // 1-based position restored from the state file, 0 if none
+}
+
+// sessionPoolState records which token was active when the state was written.
+type sessionPoolState struct {
+	Checksum       string `json:"checksum"`
+	ActivatedIndex int    `json:"activated_index"` // 1-based position of the last activated token
+}
+
+// loadSessionTokenPool reads one session token per line from path, skipping
+// blank lines, '#' comments and duplicates.
+func loadSessionTokenPool(path string) (*sessionTokenPool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading token file: %w", err)
+	}
+	var tokens []string
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if _, dup := seen[line]; dup {
+			continue
+		}
+		seen[line] = struct{}{}
+		tokens = append(tokens, line)
+	}
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("no session tokens found in %s", path)
+	}
+	pool := &sessionTokenPool{
+		tokens:    tokens,
+		statePath: stateFilePath(path),
+		checksum:  sha256Hex(data),
+	}
+	pool.restoreState()
+	return pool, nil
+}
+
+func stateFilePath(tokenFilePath string) string {
+	dir := filepath.Dir(tokenFilePath)
+	name := filepath.Base(tokenFilePath) + ".state"
+	return filepath.Join(dir, name)
+}
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// restoreState resumes the pool from the persisted activation index when the
+// token file is unchanged since the state was written.
+func (p *sessionTokenPool) restoreState() {
+	data, err := os.ReadFile(p.statePath)
+	if err != nil {
+		return
+	}
+	var state sessionPoolState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return
+	}
+	if state.Checksum != p.checksum || state.ActivatedIndex < 1 || state.ActivatedIndex > len(p.tokens) {
+		return
+	}
+	// Retry the saved token first: its quota may still have traffic left.
+	p.nextIdx = state.ActivatedIndex - 1
+	p.resumedFrom = state.ActivatedIndex
+}
+
+// saveState persists the 1-based position of the last activated token so a
+// restart can resume without replaying already exhausted tokens. The write is
+// atomic (temp file + rename) so a hard shutdown mid-write cannot corrupt
+// the state file. Failures (e.g. read-only directory) are logged and
+// ignored: state persistence must never interrupt the proxy.
+func (p *sessionTokenPool) saveState(index int) {
+	data, err := json.Marshal(sessionPoolState{Checksum: p.checksum, ActivatedIndex: index})
+	if err != nil {
+		return
+	}
+	tmpPath := p.statePath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		logWarn("saving token pool state failed path=%s err=%v", p.statePath, err)
+		return
+	}
+	if err := os.Rename(tmpPath, p.statePath); err != nil {
+		_ = os.Remove(tmpPath)
+		logWarn("saving token pool state failed path=%s err=%v", p.statePath, err)
+	}
+}
+
+func (p *sessionTokenPool) resumedIndex() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.resumedFrom
+}
+
+// next returns the next unused token together with its 1-based position.
+func (p *sessionTokenPool) next() (token string, index int, total int, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.nextIdx >= len(p.tokens) {
+		return "", 0, len(p.tokens), false
+	}
+	token = p.tokens[p.nextIdx]
+	p.nextIdx++
+	return token, p.nextIdx, len(p.tokens), true
+}
+
+func (p *sessionTokenPool) size() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.tokens)
+}
+
+// activateNextPoolToken exchanges the next session token from the pool for
+// OAuth tokens, skipping tokens that FxA rejects.
+func activateNextPoolToken(pool *sessionTokenPool) (*runtimeAuth, error) {
+	for {
+		sessionToken, index, total, ok := pool.next()
+		if !ok {
+			return nil, errTokenPoolExhausted
+		}
+		fmt.Printf("Activating session token %d/%d... ", index, total)
+		ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+		token, err := vpnclient.FxaOAuthToken(ctx, sessionToken)
+		cancel()
+		if err != nil {
+			fmt.Printf("failed: %v\n", err)
+			continue
+		}
+		fmt.Println("OK")
+		pool.saveState(index)
+		return &runtimeAuth{Token: token, ObtainedAt: time.Now()}, nil
+	}
+}
+
+// isQuotaExhausted reports whether the proxy pass quota headers indicate
+// that no monthly traffic is left.
+func isQuotaExhausted(pass *vpnclient.ProxyPassInfo) bool {
+	if pass == nil || pass.QuotaLeft == "" {
+		return false
+	}
+	left, err := strconv.ParseInt(pass.QuotaLeft, 10, 64)
+	if err != nil {
+		return false
+	}
+	return left <= 0
+}
+
+func isExistingFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
+// acquireInitialPass fetches the first proxy pass. A Guardian token
+// rejection (HTTP 401/403) is recovered from by refreshing the OAuth token
+// and activating the account; when the token's monthly quota is exhausted
+// (HTTP 429 or zero remaining) and a session token pool is configured, it
+// rotates to the next token.
+func acquireInitialPass(guardian string, auth *runtimeAuth, pool *sessionTokenPool) (*vpnclient.ProxyPassInfo, *runtimeAuth, error) {
+	for {
+		pass, err := fetchProxyPassCtx(guardian, auth.Token.AccessToken)
+		if err == nil && !isQuotaExhausted(pass) {
+			return pass, auth, nil
+		}
+
+		if errors.Is(err, vpnclient.ErrTokenInvalid) {
+			logInfo("cached OAuth access was rejected by Guardian; refreshing token")
+			if refreshed, refreshErr := refreshRuntimeAuth(auth); refreshErr == nil {
+				auth = refreshed
+				pass, err = fetchProxyPassCtx(guardian, auth.Token.AccessToken)
+			} else {
+				logWarn("refreshing OAuth token after Guardian rejection failed: %v", refreshErr)
+			}
+			if errors.Is(err, vpnclient.ErrTokenInvalid) {
+				logInfo("Guardian account is not activated for Firefox VPN proxy access; activating")
+				ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+				_, activateErr := vpnclient.ActivateGuardian(ctx, guardian, auth.Token.AccessToken)
+				cancel()
+				if activateErr != nil {
+					logWarn("activating Guardian account failed: %v", activateErr)
+				} else {
+					logInfo("Guardian account activated")
+					pass, err = fetchProxyPassCtx(guardian, auth.Token.AccessToken)
+				}
+			}
+			if err == nil && !isQuotaExhausted(pass) {
+				return pass, auth, nil
+			}
+		}
+
+		if err != nil && !errors.Is(err, vpnclient.ErrQuotaExceeded) && !errors.Is(err, vpnclient.ErrTokenInvalid) {
+			// Transient failure (network, server error): no point burning
+			// through the pool.
+			return nil, nil, err
+		}
+		if pool == nil {
+			if err != nil {
+				return nil, nil, err
+			}
+			return pass, auth, nil
+		}
+		if errors.Is(err, vpnclient.ErrTokenInvalid) {
+			logWarn("session token rejected by Guardian; switching to the next token")
+		} else {
+			logWarn("session token quota exhausted; switching to the next token")
+		}
+		nextAuth, nextErr := activateNextPoolToken(pool)
+		if nextErr != nil {
+			if err != nil {
+				return nil, nil, err
+			}
+			return nil, nil, nextErr
+		}
+		if saveErr := vpnclient.SaveTokens(nextAuth.Token); saveErr != nil {
+			logWarn("saving tokens failed: %v", saveErr)
+		}
+		auth = nextAuth
+	}
 }
 
 func printRuntimeInfo(guardian, accessToken string, pass *vpnclient.ProxyPassInfo, countries []vpnclient.Country) {
 	fmt.Println("=== User Info ===")
-	ent, err := vpnclient.FetchUserInfo(guardian, accessToken)
+	ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+	ent, err := vpnclient.FetchUserInfo(ctx, guardian, accessToken)
+	cancel()
 	if err != nil {
 		fmt.Printf("Warning: could not fetch user info: %v\n", err)
 	} else {
@@ -675,7 +938,9 @@ func obtainOAuthToken(forceLogin bool) (*vpnclient.TokenResponse, string, time.T
 			}
 			if saved.RefreshToken != "" {
 				fmt.Print("Refreshing token... ")
-				token, err := vpnclient.FxaRefreshToken(saved.RefreshToken)
+				ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+				token, err := vpnclient.FxaRefreshToken(ctx, saved.RefreshToken)
+				cancel()
 				if err != nil {
 					fmt.Printf("failed: %v\n", err)
 					logWarn("saved tokens were preserved; retry by restarting the program, or use -login to force a fresh login")
@@ -690,21 +955,70 @@ func obtainOAuthToken(forceLogin bool) (*vpnclient.TokenResponse, string, time.T
 	email, password := promptCredentials()
 
 	fmt.Print("Logging in... ")
-	loginResp, err := vpnclient.FxaLogin(email, password)
+	loginCtx, loginCancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+	loginResp, err := vpnclient.FxaLogin(loginCtx, email, password)
+	loginCancel()
 	if err != nil {
 		fmt.Printf("failed: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Println("OK")
 
+	if !loginResp.Verified {
+		verifySessionInteractively(email, loginResp.SessionToken, loginResp.VerificationMethod)
+	}
+
 	fmt.Print("Getting OAuth token... ")
-	token, err := vpnclient.FxaOAuthToken(loginResp.SessionToken)
+	tokenCtx, tokenCancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+	token, err := vpnclient.FxaOAuthToken(tokenCtx, loginResp.SessionToken)
+	tokenCancel()
 	if err != nil {
 		fmt.Printf("failed: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Println("OK")
 	return token, "fresh login", time.Now()
+}
+
+// verifySessionInteractively prompts for the confirmation code FxA sent to
+// the account email at login time and retries until the session is verified.
+func verifySessionInteractively(email, sessionToken, verificationMethod string) {
+	reader := bufio.NewReader(os.Stdin)
+
+	if verificationMethod == "email" {
+		// Server fell back to the confirmation-link flow; there is no
+		// code to enter.
+		fmt.Printf("This sign-in must be confirmed: a confirmation link was sent to %s.\n", email)
+		fmt.Print("Open the link from the email, then press Enter here to continue: ")
+		if _, err := reader.ReadString('\n'); err != nil {
+			logError("reading confirmation input failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	fmt.Printf("This sign-in must be confirmed: a verification code was sent to %s.\n", email)
+	for {
+		fmt.Print("Enter the verification code from the email: ")
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			logError("reading verification code failed: %v", err)
+			os.Exit(1)
+		}
+		code := strings.TrimSpace(line)
+		if code == "" {
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+		err = vpnclient.FxaVerifySession(ctx, sessionToken, code)
+		cancel()
+		if err == nil {
+			fmt.Println("Session verified.")
+			return
+		}
+		fmt.Printf("Verification failed: %v\n", err)
+	}
 }
 
 func promptCredentials() (string, string) {
@@ -2671,6 +2985,7 @@ func (a tunnelAddr) String() string  { return string(a) }
 
 type managedSession struct {
 	session   proxySession
+	rawToken  string
 	expiresAt time.Time
 	refs      int
 	accepting bool
@@ -2685,6 +3000,7 @@ type proxyControllerConfig struct {
 	UseH3      bool
 	Sessions   int
 	StatusFile string
+	TokenPool  *sessionTokenPool // optional; enables automatic token rotation on quota exhaustion
 }
 
 type proxyController struct {
@@ -2694,6 +3010,7 @@ type proxyController struct {
 
 	sessionFactory func(token string) (proxySession, error)
 	refreshSession func() error
+	tokenPool      *sessionTokenPool
 
 	renewMu    sync.Mutex
 	mu         sync.Mutex
@@ -2761,9 +3078,11 @@ func newProxyController(cfg proxyControllerConfig) (*proxyController, error) {
 		sessionFactory: factory,
 		auth:           cfg.Auth,
 		statusFile:     cfg.StatusFile,
+		tokenPool:      cfg.TokenPool,
 		done:           make(chan struct{}),
 		current: &managedSession{
 			session:   session,
+			rawToken:  cfg.Pass.RawToken,
 			expiresAt: cfg.Pass.ExpiresAt(),
 			accepting: true,
 		},
@@ -2886,7 +3205,7 @@ func (c *proxyController) maybeCloseLocked(ms *managedSession) {
 	ms.session = nil
 }
 
-func (c *proxyController) swapSession(newSession proxySession, expiresAt time.Time) bool {
+func (c *proxyController) swapSession(newSession proxySession, rawToken string, expiresAt time.Time) bool {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -2896,6 +3215,7 @@ func (c *proxyController) swapSession(newSession proxySession, expiresAt time.Ti
 	old := c.current
 	c.current = &managedSession{
 		session:   newSession,
+		rawToken:  rawToken,
 		expiresAt: expiresAt,
 		accepting: true,
 	}
@@ -3116,27 +3436,101 @@ func (c *proxyController) rebuildSession(failedSession *managedSession) error {
 }
 
 func (c *proxyController) renewLocked() error {
-	auth, err := c.ensureOAuthToken()
+	_, pass, err := c.acquireUsablePass()
 	if err != nil {
 		return err
 	}
+	return c.adoptPass(pass)
+}
 
-	pass, err := vpnclient.FetchProxyPass(c.guardian, auth.Token.AccessToken)
+// acquireUsablePass returns an auth and a proxy pass whose monthly quota is
+// not yet exhausted. A Guardian token rejection is recovered from by
+// refreshing the OAuth token and activating the account; when the current
+// account's quota runs out (HTTP 429 or zero remaining) and a session token
+// pool is configured, it activates the next token from the pool.
+func (c *proxyController) acquireUsablePass() (*runtimeAuth, *vpnclient.ProxyPassInfo, error) {
+	auth, err := c.ensureOAuthToken()
 	if err != nil {
-		var guardianErr *vpnclient.GuardianHTTPError
-		if !errors.As(err, &guardianErr) || guardianErr.StatusCode != http.StatusForbidden {
-			return err
+		return nil, nil, err
+	}
+	for {
+		// Each fetch attempt gets its own deadline so token rotation
+		// retries are not starved by earlier slow attempts.
+		pass, fetchErr := fetchProxyPassCtx(c.guardian, auth.Token.AccessToken)
+		if fetchErr == nil && !isQuotaExhausted(pass) {
+			return auth, pass, nil
 		}
-		logInfo("Guardian account requires activation during proxy pass renewal; activating")
-		if _, activateErr := vpnclient.ActivateGuardian(c.guardian, auth.Token.AccessToken); activateErr != nil {
-			return activateErr
+		if fetchErr != nil && !errors.Is(fetchErr, vpnclient.ErrQuotaExceeded) && !errors.Is(fetchErr, vpnclient.ErrTokenInvalid) {
+			return nil, nil, fetchErr
 		}
-		logInfo("Guardian account activated during proxy pass renewal")
-		pass, err = vpnclient.FetchProxyPass(c.guardian, auth.Token.AccessToken)
+
+		if errors.Is(fetchErr, vpnclient.ErrTokenInvalid) {
+			logInfo("OAuth access was rejected by Guardian during renewal; refreshing token")
+			if refreshed, refreshErr := refreshRuntimeAuth(auth); refreshErr == nil {
+				auth = refreshed
+				c.mu.Lock()
+				c.auth = refreshed
+				c.mu.Unlock()
+				pass, fetchErr = fetchProxyPassCtx(c.guardian, auth.Token.AccessToken)
+				if fetchErr == nil && !isQuotaExhausted(pass) {
+					return auth, pass, nil
+				}
+			}
+			if errors.Is(fetchErr, vpnclient.ErrTokenInvalid) {
+				logInfo("Guardian account requires activation during proxy pass renewal; activating")
+				ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+				_, activateErr := vpnclient.ActivateGuardian(ctx, c.guardian, auth.Token.AccessToken)
+				cancel()
+				if activateErr != nil {
+					return nil, nil, activateErr
+				}
+				logInfo("Guardian account activated during proxy pass renewal")
+				pass, fetchErr = fetchProxyPassCtx(c.guardian, auth.Token.AccessToken)
+				if fetchErr == nil && !isQuotaExhausted(pass) {
+					return auth, pass, nil
+				}
+			}
+		}
+
+		// Token unusable on this account (quota exhausted or rejected).
+		if c.tokenPool == nil {
+			if fetchErr != nil {
+				return nil, nil, fetchErr
+			}
+			return auth, pass, nil
+		}
+		if errors.Is(fetchErr, vpnclient.ErrTokenInvalid) {
+			logWarn("session token rejected by Guardian; switching to the next token")
+		} else {
+			logWarn("session token quota exhausted; switching to the next token")
+		}
+		auth, err = c.nextTokenAuth()
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 	}
+}
+
+// nextTokenAuth activates the next session token from the pool and makes it
+// the controller's current auth.
+func (c *proxyController) nextTokenAuth() (*runtimeAuth, error) {
+	auth, err := activateNextPoolToken(c.tokenPool)
+	if err != nil {
+		return nil, err
+	}
+	if err := vpnclient.SaveTokens(auth.Token); err != nil {
+		logWarn("saving tokens failed: %v", err)
+	}
+	c.mu.Lock()
+	c.auth = auth
+	c.mu.Unlock()
+	return auth, nil
+}
+
+// adoptPass applies pass to the current session: when the session supports
+// in-place token updates the session is retained, otherwise a fresh session
+// pool is built and swapped in while active tunnels drain gracefully.
+func (c *proxyController) adoptPass(pass *vpnclient.ProxyPassInfo) error {
 	logProxyPassTimeCorrection(pass)
 
 	if err := c.updateCurrentSessionToken(pass.RawToken, pass.ExpiresAt()); err == nil {
@@ -3152,11 +3546,51 @@ func (c *proxyController) renewLocked() error {
 		return err
 	}
 
-	if !c.swapSession(session, pass.ExpiresAt()) {
+	if !c.swapSession(session, pass.RawToken, pass.ExpiresAt()) {
 		return errNoUsableProxySession
 	}
 	logInfo("proxy pass renewed successfully next_expiry=%s", pass.ExpiresAt().Format(time.RFC3339))
 	return nil
+}
+
+// runQuotaMonitorLoop periodically checks the remaining monthly quota and
+// rotates to the next session token once it is exhausted, without waiting
+// for the proxy pass itself to expire.
+func (c *proxyController) runQuotaMonitorLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			c.checkQuota()
+		}
+	}
+}
+
+func (c *proxyController) checkQuota() {
+	c.renewMu.Lock()
+	defer c.renewMu.Unlock()
+
+	_, pass, err := c.acquireUsablePass()
+	if err != nil {
+		logWarn("quota check failed: %s", logErr(err))
+		return
+	}
+
+	c.mu.Lock()
+	unchanged := c.current != nil && c.current.rawToken == pass.RawToken
+	c.mu.Unlock()
+	if unchanged {
+		return
+	}
+	if err := c.adoptPass(pass); err != nil {
+		logWarn("quota check: could not rebuild proxy sessions: %s", logErr(err))
+		return
+	}
+	logInfo("proxy sessions refreshed after token rotation")
 }
 
 func (c *proxyController) updateCurrentSessionToken(token string, expiresAt time.Time) error {
@@ -3172,6 +3606,7 @@ func (c *proxyController) updateCurrentSessionToken(token string, expiresAt time
 	if err := updater.UpdateToken(token); err != nil {
 		return err
 	}
+	c.current.rawToken = token
 	c.current.expiresAt = expiresAt
 	return nil
 }

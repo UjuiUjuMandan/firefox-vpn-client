@@ -1,8 +1,10 @@
 package vpnclient
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -59,6 +61,15 @@ type proxyPassResponse struct {
 	Token string `json:"token"`
 }
 
+// ErrQuotaExceeded signals that the account's monthly proxy quota is
+// exhausted (Guardian responds with HTTP 429).
+var ErrQuotaExceeded = errors.New("quota exceeded")
+
+// ErrTokenInvalid signals that Guardian rejected the access token
+// (HTTP 401/403), e.g. the account has no active subscription. Callers
+// with a session token pool should rotate to the next token on this error.
+var ErrTokenInvalid = errors.New("token invalid")
+
 type GuardianHTTPError struct {
 	Operation  string
 	StatusCode int
@@ -69,13 +80,13 @@ func (e *GuardianHTTPError) Error() string {
 	return fmt.Sprintf("%s returned HTTP %d: %s", e.Operation, e.StatusCode, e.Body)
 }
 
-func fetchProxyPass(endpoint, accessToken string) (*ProxyPassInfo, error) {
+func fetchProxyPass(ctx context.Context, endpoint, accessToken string) (*ProxyPassInfo, error) {
 	if endpoint == "" {
 		endpoint = GuardianEndpointDefault
 	}
 	url := strings.TrimRight(endpoint, "/") + "/api/v1/fpn/token"
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -89,8 +100,11 @@ func fetchProxyPass(endpoint, accessToken string) (*ProxyPassInfo, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 429 {
-		return nil, fmt.Errorf("quota exceeded (HTTP 429): %s", readErrorBody(resp.Body))
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, fmt.Errorf("%w (HTTP 429): %s", ErrQuotaExceeded, readErrorBody(resp.Body))
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("%w (HTTP %d): %s", ErrTokenInvalid, resp.StatusCode, readErrorBody(resp.Body))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, &GuardianHTTPError{
@@ -203,13 +217,13 @@ func withinTimeWindow(t, start, end time.Time) bool {
 	return !t.Before(start) && !t.After(end)
 }
 
-func fetchUserInfo(endpoint, accessToken string) (*Entitlement, error) {
+func fetchUserInfo(ctx context.Context, endpoint, accessToken string) (*Entitlement, error) {
 	if endpoint == "" {
 		endpoint = GuardianEndpointDefault
 	}
 	url := strings.TrimRight(endpoint, "/") + "/api/v1/fpn/status"
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -243,13 +257,13 @@ func fetchUserInfo(endpoint, accessToken string) (*Entitlement, error) {
 	return &ent, nil
 }
 
-func activateGuardian(endpoint, accessToken string) (*Entitlement, error) {
+func activateGuardian(ctx context.Context, endpoint, accessToken string) (*Entitlement, error) {
 	if endpoint == "" {
 		endpoint = GuardianEndpointDefault
 	}
 	url := strings.TrimRight(endpoint, "/") + "/api/v1/fpn/activate"
 
-	req, err := http.NewRequest("POST", url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -290,21 +304,11 @@ func parseJWTClaims(token string) (*ProxyPassClaims, error) {
 	}
 
 	payload := parts[1]
-	// Add padding if needed
-	switch len(payload) % 4 {
-	case 2:
-		payload += "=="
-	case 3:
-		payload += "="
-	}
-
-	decoded, err := base64.URLEncoding.DecodeString(payload)
+	// JWT segments use unpadded base64url; RawURLEncoding handles the
+	// missing padding without manual "% 4" arithmetic.
+	decoded, err := base64.RawURLEncoding.DecodeString(payload)
 	if err != nil {
-		// Try standard base64 as fallback
-		decoded, err = base64.StdEncoding.DecodeString(payload)
-		if err != nil {
-			return nil, fmt.Errorf("decoding JWT payload: %w", err)
-		}
+		return nil, fmt.Errorf("decoding JWT payload: %w", err)
 	}
 
 	var claims ProxyPassClaims
@@ -314,14 +318,14 @@ func parseJWTClaims(token string) (*ProxyPassClaims, error) {
 	return &claims, nil
 }
 
-func FetchProxyPass(endpoint, accessToken string) (*ProxyPassInfo, error) {
-	return fetchProxyPass(endpoint, accessToken)
+func FetchProxyPass(ctx context.Context, endpoint, accessToken string) (*ProxyPassInfo, error) {
+	return fetchProxyPass(ctx, endpoint, accessToken)
 }
 
-func FetchUserInfo(endpoint, accessToken string) (*Entitlement, error) {
-	return fetchUserInfo(endpoint, accessToken)
+func FetchUserInfo(ctx context.Context, endpoint, accessToken string) (*Entitlement, error) {
+	return fetchUserInfo(ctx, endpoint, accessToken)
 }
 
-func ActivateGuardian(endpoint, accessToken string) (*Entitlement, error) {
-	return activateGuardian(endpoint, accessToken)
+func ActivateGuardian(ctx context.Context, endpoint, accessToken string) (*Entitlement, error) {
+	return activateGuardian(ctx, endpoint, accessToken)
 }
