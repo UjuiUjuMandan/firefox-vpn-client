@@ -1,0 +1,119 @@
+name: Build and Release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: '7'
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+        run: |
+          ext=""
+          if [ "$GOOS" = "windows" ]; then
+            ext=".exe"
+          fi
+          BIN_NAME="firefox-vpn-proxy-${GOOS}-${GOARCH}"
+          if [ "$GOARCH" = "arm" ] && [ -n "$GOARM" ]; then
+            BIN_NAME="${BIN_NAME}v${GOARM}"
+          fi
+          go build -trimpath -ldflags="-s -w" -o "dist/${BIN_NAME}${ext}" ./cmd/proxy-demo
+
+      - name: Package artifact
+        run: |
+          mkdir -p release
+          FILE="$(find dist -type f -maxdepth 1 | head -n 1)"
+          BASENAME="$(basename "$FILE")"
+          NAME="${BASENAME%.*}"
+          if [[ "$BASENAME" == *.exe ]]; then
+            ARCHIVE="release/${NAME}.zip"
+            (cd dist && zip -9 "../${ARCHIVE}" "$BASENAME")
+          else
+            ARCHIVE="release/${NAME}.tar.gz"
+            tar -C dist -czf "$ARCHIVE" "$BASENAME"
+          fi
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+        id: package
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('-v{0}', matrix.goarm) || '' }}
+          path: ${{ steps.package.outputs.archive }}
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: release-artifacts
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/**/*
+          generate_release_notes: true
