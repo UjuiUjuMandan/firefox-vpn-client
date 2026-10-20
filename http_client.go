@@ -19,11 +19,14 @@ const (
 // its Transport. It is deliberately kept separate from http.DefaultClient.
 // The cookie jar holds Fastly anti-bot challenge cookies earned by
 // solveFastlyChallenge.
+//
+//nolint:gochecknoglobals // shared process-wide client by design; see the doc comment above
 var controlPlaneHTTPClient = func() *http.Client {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		panic(fmt.Sprintf("creating control plane cookie jar: %v", err))
 	}
+
 	return &http.Client{
 		Timeout: controlPlaneHTTPTimeout,
 		Jar:     jar,
@@ -38,7 +41,12 @@ func SetControlPlaneTransport(transport http.RoundTripper) {
 }
 
 func doControlPlane(req *http.Request) (*http.Response, error) {
-	return controlPlaneHTTPClient.Do(req)
+	resp, err := controlPlaneHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("control plane request to %s: %w", req.URL.Host, err)
+	}
+
+	return resp, nil
 }
 
 func readErrorBody(r io.Reader) string {
@@ -46,5 +54,6 @@ func readErrorBody(r io.Reader) string {
 	if err != nil {
 		return "reading error body failed: " + err.Error()
 	}
+
 	return string(body)
 }

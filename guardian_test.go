@@ -9,6 +9,7 @@ func TestDetectProxyPassClaimTimeOffsetLeavesStandardJWTTime(t *testing.T) {
 	previousLocal := time.Local
 	local := time.FixedZone("CST", 8*60*60)
 	time.Local = local
+
 	t.Cleanup(func() { time.Local = previousLocal })
 
 	now := time.Date(2026, 7, 2, 22, 25, 50, 0, local)
@@ -27,6 +28,7 @@ func TestDetectProxyPassClaimTimeOffsetCorrectsLocalWallClockJWTTime(t *testing.
 	previousLocal := time.Local
 	local := time.FixedZone("CST", 8*60*60)
 	time.Local = local
+
 	t.Cleanup(func() { time.Local = previousLocal })
 
 	now := time.Date(2026, 7, 2, 22, 25, 50, 0, local)
@@ -56,6 +58,7 @@ func TestDetectProxyPassClaimTimeOffsetUsesIssuedAtWhenNotBeforeMissing(t *testi
 	previousLocal := time.Local
 	local := time.FixedZone("CST", 8*60*60)
 	time.Local = local
+
 	t.Cleanup(func() { time.Local = previousLocal })
 
 	now := time.Date(2026, 7, 2, 22, 36, 51, 0, local)
@@ -76,6 +79,7 @@ func TestDetectProxyPassClaimTimeOffsetUsesExpiryWhenStartClaimsMissing(t *testi
 	previousLocal := time.Local
 	local := time.FixedZone("CST", 8*60*60)
 	time.Local = local
+
 	t.Cleanup(func() { time.Local = previousLocal })
 
 	now := time.Date(2026, 7, 2, 22, 36, 51, 0, local)
@@ -109,6 +113,7 @@ func TestDetectProxyPassClaimTimeOffsetLeavesFreshExpiryWithoutStartClaims(t *te
 	previousLocal := time.Local
 	local := time.FixedZone("CST", 8*60*60)
 	time.Local = local
+
 	t.Cleanup(func() { time.Local = previousLocal })
 
 	now := time.Date(2026, 7, 2, 22, 36, 51, 0, local)

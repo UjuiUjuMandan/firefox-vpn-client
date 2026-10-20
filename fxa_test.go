@@ -3,6 +3,8 @@ package vpnclient
 import "testing"
 
 func TestNewFxaAPIErrorParsesErrno(t *testing.T) {
+	t.Parallel()
+
 	apiErr := newFxaAPIError(400, []byte(`{"code":400,"errno":107,"message":"Invalid parameter: verificationMethod"}`))
 	if apiErr.Errno != fxaErrnoInvalidParameter {
 		t.Fatalf("expected errno %d, got %d", fxaErrnoInvalidParameter, apiErr.Errno)

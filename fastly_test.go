@@ -17,6 +17,7 @@ func TestSolvePowFindsSuffix(t *testing.T) {
 	if !ok {
 		t.Fatal("solvePow did not find a solution")
 	}
+
 	if answer != "Xk" {
 		t.Fatalf("expected answer Xk, got %q", answer)
 	}
@@ -45,9 +46,11 @@ func TestParseChallengeInitExtractsToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseChallengeInit returned error: %v", err)
 	}
+
 	if token != "token-abc" {
 		t.Fatalf("expected token-abc, got %q", token)
 	}
+
 	if len(challenges) != 1 || challenges[0].Ty != "pat" {
 		t.Fatalf("unexpected challenges: %+v", challenges)
 	}
@@ -57,19 +60,24 @@ func TestParseChallengeInitPowData(t *testing.T) {
 	t.Parallel()
 
 	script := `;init([{"ty":"pow","data":{"base":"b","expires":"123","hmac":"h","hash":"00"}}], "tok", "/_fs-ch-x", true);`
+
 	challenges, _, err := parseChallengeInit(script)
 	if err != nil {
 		t.Fatalf("parseChallengeInit returned error: %v", err)
 	}
+
 	if len(challenges) != 1 || challenges[0].Ty != "pow" {
 		t.Fatalf("unexpected challenges: %+v", challenges)
 	}
 
-	var d fastlyPowData
-	if err := json.Unmarshal(challenges[0].Data, &d); err != nil {
+	var powData fastlyPowData
+
+	err = json.Unmarshal(challenges[0].Data, &powData)
+	if err != nil {
 		t.Fatalf("unmarshalling pow data: %v", err)
 	}
-	if d.Base != "b" || d.HMAC != "h" || d.Expires != "123" {
-		t.Fatalf("unexpected pow data: %+v", d)
+
+	if powData.Base != "b" || powData.HMAC != "h" || powData.Expires != "123" {
+		t.Fatalf("unexpected pow data: %+v", powData)
 	}
 }

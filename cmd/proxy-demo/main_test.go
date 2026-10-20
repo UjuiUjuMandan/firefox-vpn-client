@@ -20,6 +20,17 @@ import (
 	vpnclient "firefox-vpn-client"
 )
 
+// Shared server-list fixture values used across the proxy selection tests.
+const (
+	fixtureCountryUS  = "United States"
+	fixtureCountryFR  = "France"
+	fixtureCityFR     = "LFPB"
+	fixtureHostFR     = "fr.example"
+	fixtureTokenOld   = "old-token"
+	fixtureTokenNew   = "new-token"
+	fixtureBadGateway = "502 Bad Gateway"
+)
+
 func TestNormalizeProxyURLAddsHTTPS(t *testing.T) {
 	t.Parallel()
 
@@ -31,6 +42,7 @@ func TestNormalizeProxyURLAddsHTTPS(t *testing.T) {
 	if got.Scheme != "https" {
 		t.Fatalf("expected https scheme, got %q", got.Scheme)
 	}
+
 	if got.Host != "proxy.example.test:443" {
 		t.Fatalf("expected host proxy.example.test:443, got %q", got.Host)
 	}
@@ -40,13 +52,16 @@ func TestObtainOAuthTokenUsesValidCachedAccessToken(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
+
 	want := &vpnclient.TokenResponse{
 		AccessToken:  "cached-access-token",
 		RefreshToken: "refresh-token",
 		ExpiresIn:    3600,
 		Scope:        "profile",
 	}
-	if err := vpnclient.SaveTokens(want); err != nil {
+
+	err := vpnclient.SaveTokens(want)
+	if err != nil {
 		t.Fatalf("SaveTokens returned error: %v", err)
 	}
 
@@ -54,9 +69,11 @@ func TestObtainOAuthTokenUsesValidCachedAccessToken(t *testing.T) {
 	if source != "cached access token" {
 		t.Fatalf("expected cached access token source, got %q", source)
 	}
+
 	if got.AccessToken != want.AccessToken || got.RefreshToken != want.RefreshToken {
 		t.Fatalf("expected cached token %#v, got %#v", want, got)
 	}
+
 	if time.Since(obtainedAt) > time.Minute {
 		t.Fatalf("expected cached obtained time to be preserved, got %s", obtainedAt)
 	}
@@ -66,27 +83,34 @@ func TestHandshakeSOCKS5DomainConnect(t *testing.T) {
 	t.Parallel()
 
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	errCh := make(chan error, 1)
+
 	go func() {
 		_, err := client.Write([]byte{socksVersion5, 0x01, socksAuthNoAuth})
 		if err != nil {
 			errCh <- err
+
 			return
 		}
 
 		reply := make([]byte, 2)
+
 		_, err = io.ReadFull(client, reply)
 		if err != nil {
 			errCh <- err
+
 			return
 		}
+
 		if !bytes.Equal(reply, []byte{socksVersion5, socksAuthNoAuth}) {
 			errCh <- errors.New("unexpected auth reply")
+
 			return
 		}
+
 		_, err = client.Write([]byte{
 			socksVersion5, socksCmdConnect, 0x00, socksAtypDomain, 0x0b,
 			'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm',
@@ -94,8 +118,10 @@ func TestHandshakeSOCKS5DomainConnect(t *testing.T) {
 		})
 		if err != nil {
 			errCh <- err
+
 			return
 		}
+
 		errCh <- nil
 	}()
 
@@ -103,13 +129,17 @@ func TestHandshakeSOCKS5DomainConnect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handshakeSOCKS5 returned error: %v", err)
 	}
+
 	if replyCode != socksReplySuccess {
 		t.Fatalf("expected success code, got %d", replyCode)
 	}
+
 	if target != "example.com:443" {
 		t.Fatalf("expected target example.com:443, got %q", target)
 	}
-	if err := <-errCh; err != nil {
+
+	err = <-errCh
+	if err != nil {
 		t.Fatalf("client goroutine failed: %v", err)
 	}
 }
@@ -118,25 +148,34 @@ func TestHandshakeSOCKS5RejectsUnsupportedMethod(t *testing.T) {
 	t.Parallel()
 
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	errCh := make(chan error, 1)
+
 	go func() {
-		if _, err := client.Write([]byte{socksVersion5, 0x01, 0x02}); err != nil {
-			errCh <- err
-			return
-		}
-		reply := make([]byte, 2)
-		_, err := io.ReadFull(client, reply)
+		_, err := client.Write([]byte{socksVersion5, 0x01, 0x02})
 		if err != nil {
 			errCh <- err
+
 			return
 		}
+
+		reply := make([]byte, 2)
+
+		_, err = io.ReadFull(client, reply)
+		if err != nil {
+			errCh <- err
+
+			return
+		}
+
 		if !bytes.Equal(reply, []byte{socksVersion5, socksAuthNoAccept}) {
 			errCh <- errors.New("unexpected auth rejection reply")
+
 			return
 		}
+
 		errCh <- nil
 	}()
 
@@ -144,7 +183,9 @@ func TestHandshakeSOCKS5RejectsUnsupportedMethod(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "no supported SOCKS auth methods") {
 		t.Fatalf("expected unsupported auth error, got %v", err)
 	}
-	if err := <-errCh; err != nil {
+
+	err = <-errCh
+	if err != nil {
 		t.Fatalf("client goroutine failed: %v", err)
 	}
 }
@@ -153,8 +194,8 @@ func TestHandshakeSOCKS5RejectsUnsupportedCommand(t *testing.T) {
 	t.Parallel()
 
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	go func() {
 		_, _ = client.Write([]byte{socksVersion5, 0x01, socksAuthNoAuth})
@@ -169,6 +210,7 @@ func TestHandshakeSOCKS5RejectsUnsupportedCommand(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected unsupported command error")
 	}
+
 	if replyCode != socksReplyCmdUnsup {
 		t.Fatalf("expected command unsupported reply code, got %d", replyCode)
 	}
@@ -179,7 +221,7 @@ func TestConnectProxyHostsIncludesDefaultConnectServers(t *testing.T) {
 
 	countries := []vpnclient.Country{
 		{
-			Name: "United States",
+			Name: fixtureCountryUS,
 			Code: "US",
 			Cities: []vpnclient.City{
 				{
@@ -195,10 +237,13 @@ func TestConnectProxyHostsIncludesDefaultConnectServers(t *testing.T) {
 	}
 
 	got := connectProxyHosts(countries)
+
 	want := []string{"default.example:443", "proto.example:8443"}
+
 	if len(got) != len(want) {
 		t.Fatalf("expected %d proxies, got %d: %v", len(want), len(got), got)
 	}
+
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("expected %q at index %d, got %q", want[i], i, got[i])
@@ -229,13 +274,16 @@ func TestConnectProxyCandidatesIncludeExitMetadata(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 candidate, got %d: %v", len(got), got)
 	}
+
 	candidate := got[0]
 	if candidate.Addr != "de.example:443" {
 		t.Fatalf("expected proxy de.example:443, got %q", candidate.Addr)
 	}
+
 	if candidate.CountryName != "Germany" || candidate.CountryCode != "DE" {
 		t.Fatalf("unexpected country metadata: %#v", candidate)
 	}
+
 	if candidate.CityName != "Frankfurt" || candidate.CityCode != "fra" {
 		t.Fatalf("unexpected city metadata: %#v", candidate)
 	}
@@ -264,9 +312,11 @@ func TestResolveProxyMatchesExplicitProxyMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveProxy returned error: %v", err)
 	}
+
 	if got.Addr != "https://jp.example" {
 		t.Fatalf("expected original proxy flag to be preserved, got %q", got.Addr)
 	}
+
 	if got.CountryCode != "JP" || got.CityCode != "tyo" {
 		t.Fatalf("expected explicit proxy metadata match, got %#v", got)
 	}
@@ -277,21 +327,21 @@ func TestSelectProxyCandidateRequiresExplicitCountry(t *testing.T) {
 
 	countries := []vpnclient.Country{
 		{
-			Name: "United States",
+			Name: fixtureCountryUS,
 			Code: "US",
 			Cities: []vpnclient.City{{
-				Name:    "United States",
+				Name:    fixtureCountryUS,
 				Code:    "US",
 				Servers: []vpnclient.Server{{Hostname: "us.example", Port: 443}},
 			}},
 		},
 		{
-			Name: "France",
+			Name: fixtureCountryFR,
 			Code: "FR",
 			Cities: []vpnclient.City{{
-				Name:    "France",
-				Code:    "LFPB",
-				Servers: []vpnclient.Server{{Hostname: "fr.example", Port: 443}},
+				Name:    fixtureCountryFR,
+				Code:    fixtureCityFR,
+				Servers: []vpnclient.Server{{Hostname: fixtureHostFR, Port: 443}},
 			}},
 		},
 	}
@@ -307,10 +357,10 @@ func TestSelectProxyCandidateFiltersCountryDeterministically(t *testing.T) {
 
 	countries := []vpnclient.Country{
 		{
-			Name: "United States",
+			Name: fixtureCountryUS,
 			Code: "US",
 			Cities: []vpnclient.City{{
-				Name: "United States",
+				Name: fixtureCountryUS,
 				Code: "US",
 				Servers: []vpnclient.Server{
 					{Hostname: "us-primary.example", Port: 443},
@@ -319,12 +369,12 @@ func TestSelectProxyCandidateFiltersCountryDeterministically(t *testing.T) {
 			}},
 		},
 		{
-			Name: "France",
+			Name: fixtureCountryFR,
 			Code: "FR",
 			Cities: []vpnclient.City{{
-				Name:    "France",
-				Code:    "LFPB",
-				Servers: []vpnclient.Server{{Hostname: "fr.example", Port: 443}},
+				Name:    fixtureCountryFR,
+				Code:    fixtureCityFR,
+				Servers: []vpnclient.Server{{Hostname: fixtureHostFR, Port: 443}},
 			}},
 		},
 	}
@@ -334,6 +384,7 @@ func TestSelectProxyCandidateFiltersCountryDeterministically(t *testing.T) {
 		if err != nil {
 			t.Fatalf("selectProxyCandidate(%q) returned error: %v", filter, err)
 		}
+
 		if got.Addr != "us-primary.example:443" {
 			t.Fatalf("expected deterministic first US proxy for %q, got %q", filter, got.Addr)
 		}
@@ -344,14 +395,17 @@ func TestResolveProxyReusesPersistedSelection(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "proxy-selection.json")
+
 	want := proxyCandidate{
 		Addr:        "stable.example:443",
-		CountryName: "United States",
+		CountryName: fixtureCountryUS,
 		CountryCode: "US",
 		CityName:    "San Jose",
 		CityCode:    "SJC",
 	}
-	if err := saveProxySelection(path, want); err != nil {
+
+	err := saveProxySelection(path, want)
+	if err != nil {
 		t.Fatalf("saveProxySelection returned error: %v", err)
 	}
 
@@ -359,9 +413,11 @@ func TestResolveProxyReusesPersistedSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveProxyWithState returned error: %v", err)
 	}
+
 	if !fromState {
 		t.Fatal("expected persisted proxy selection to be reused")
 	}
+
 	if got != want {
 		t.Fatalf("expected %#v, got %#v", want, got)
 	}
@@ -371,9 +427,12 @@ func TestResolveProxyReplacesSelectionMissingFromFreshServerList(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "proxy-selection.json")
-	if err := saveProxySelection(path, proxyCandidate{Addr: "stale.example:443"}); err != nil {
+
+	err := saveProxySelection(path, proxyCandidate{Addr: "stale.example:443"})
+	if err != nil {
 		t.Fatalf("saveProxySelection returned error: %v", err)
 	}
+
 	countries := []vpnclient.Country{{
 		Name: "Japan",
 		Code: "JP",
@@ -391,9 +450,11 @@ func TestResolveProxyReplacesSelectionMissingFromFreshServerList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveProxyWithState returned error: %v", err)
 	}
+
 	if fromState {
 		t.Fatal("expected stale persisted selection to be replaced")
 	}
+
 	if got.Addr != "current.example:443" {
 		t.Fatalf("expected current server-list proxy, got %q", got.Addr)
 	}
@@ -403,20 +464,23 @@ func TestResolveProxyReplacesPersistedSelectionForConfiguredCountry(t *testing.T
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "proxy-selection.json")
-	if err := saveProxySelection(path, proxyCandidate{
+
+	err := saveProxySelection(path, proxyCandidate{
 		Addr:        "us.example:443",
-		CountryName: "United States",
+		CountryName: fixtureCountryUS,
 		CountryCode: "US",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("saveProxySelection returned error: %v", err)
 	}
+
 	countries := []vpnclient.Country{{
-		Name: "France",
+		Name: fixtureCountryFR,
 		Code: "FR",
 		Cities: []vpnclient.City{{
-			Name:    "France",
-			Code:    "LFPB",
-			Servers: []vpnclient.Server{{Hostname: "fr.example", Port: 443}},
+			Name:    fixtureCountryFR,
+			Code:    fixtureCityFR,
+			Servers: []vpnclient.Server{{Hostname: fixtureHostFR, Port: 443}},
 		}},
 	}}
 
@@ -424,9 +488,11 @@ func TestResolveProxyReplacesPersistedSelectionForConfiguredCountry(t *testing.T
 	if err != nil {
 		t.Fatalf("resolveProxyWithStateAndCountry returned error: %v", err)
 	}
+
 	if fromState {
 		t.Fatal("expected configured country to replace mismatched persisted selection")
 	}
+
 	if got.Addr != "fr.example:443" || got.CountryCode != "FR" {
 		t.Fatalf("expected French proxy, got %#v", got)
 	}
@@ -461,14 +527,17 @@ func TestParseExitProbeResponse(t *testing.T) {
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ip, country, err := parseExitProbeResponse([]byte(tt.body))
+	for _, probeCase := range tests {
+		t.Run(probeCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			exitIP, country, err := parseExitProbeResponse([]byte(probeCase.body))
 			if err != nil {
 				t.Fatalf("parseExitProbeResponse returned error: %v", err)
 			}
-			if ip != tt.wantIP || country != tt.wantCountry {
-				t.Fatalf("expected %s/%s, got %s/%s", tt.wantIP, tt.wantCountry, ip, country)
+
+			if exitIP != probeCase.wantIP || country != probeCase.wantCountry {
+				t.Fatalf("expected %s/%s, got %s/%s", probeCase.wantIP, probeCase.wantCountry, exitIP, country)
 			}
 		})
 	}
@@ -477,7 +546,8 @@ func TestParseExitProbeResponse(t *testing.T) {
 func TestParseExitProbeResponseRejectsMissingFields(t *testing.T) {
 	t.Parallel()
 
-	if _, _, err := parseExitProbeResponse([]byte("ip=not-an-ip\nloc=USA\n")); err == nil {
+	_, _, err := parseExitProbeResponse([]byte("ip=not-an-ip\nloc=USA\n"))
+	if err == nil {
 		t.Fatal("expected invalid probe response to be rejected")
 	}
 }
@@ -486,23 +556,31 @@ func TestPersistedProxyRequiresThreeStartupFailuresBeforeRemoval(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "proxy-selection.json")
+
 	candidate := proxyCandidate{Addr: "stable.example:443"}
-	if err := saveProxySelection(path, candidate); err != nil {
+
+	err := saveProxySelection(path, candidate)
+	if err != nil {
 		t.Fatalf("saveProxySelection returned error: %v", err)
 	}
+
 	for want := 1; want <= 3; want++ {
 		failures, cleared, err := recordProxySelectionFailure(path, candidate)
 		if err != nil {
 			t.Fatalf("recordProxySelectionFailure %d returned error: %v", want, err)
 		}
+
 		if failures != want {
 			t.Fatalf("expected %d failures, got %d", want, failures)
 		}
+
 		if cleared != (want == 3) {
 			t.Fatalf("unexpected cleared=%v after %d failures", cleared, want)
 		}
 	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+
+	_, err = os.Stat(path)
+	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected persisted proxy state to be removed, got %v", err)
 	}
 }
@@ -516,16 +594,19 @@ type delayedTunnelOpener struct {
 func (d *delayedTunnelOpener) OpenTunnel(string) (net.Conn, error) {
 	close(d.started)
 	<-d.release
+
 	return d.conn, nil
 }
 
 type closeTrackingConn struct {
 	net.Conn
+
 	closed atomic.Bool
 }
 
 func (c *closeTrackingConn) Close() error {
 	c.closed.Store(true)
+
 	return c.Conn.Close()
 }
 
@@ -533,7 +614,8 @@ func TestOpenTunnelContextClosesConnectionThatArrivesAfterCancellation(t *testin
 	t.Parallel()
 
 	client, peer := net.Pipe()
-	defer peer.Close()
+	defer func() { _ = peer.Close() }()
+
 	tracked := &closeTrackingConn{Conn: client}
 	opener := &delayedTunnelOpener{
 		started: make(chan struct{}),
@@ -541,11 +623,14 @@ func TestOpenTunnelContextClosesConnectionThatArrivesAfterCancellation(t *testin
 		conn:    tracked,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+
 	type result struct {
 		conn net.Conn
 		err  error
 	}
+
 	resultCh := make(chan result, 1)
+
 	go func() {
 		conn, err := openTunnelContext(ctx, opener, "example.com:443")
 		resultCh <- result{conn: conn, err: err}
@@ -553,10 +638,12 @@ func TestOpenTunnelContextClosesConnectionThatArrivesAfterCancellation(t *testin
 
 	<-opener.started
 	cancel()
+
 	got := <-resultCh
 	if got.conn != nil || !errors.Is(got.err, context.Canceled) {
 		t.Fatalf("expected canceled dial, got conn=%v err=%v", got.conn, got.err)
 	}
+
 	close(opener.release)
 	waitForCondition(t, time.Second, tracked.closed.Load)
 }
@@ -567,21 +654,25 @@ type fakeTunnelOpener struct {
 	delay  time.Duration
 }
 
-func (f *fakeTunnelOpener) OpenTunnel(authority string) (net.Conn, error) {
+func (f *fakeTunnelOpener) OpenTunnel(_ string) (net.Conn, error) {
 	current := f.active.Add(1)
+
 	for {
-		max := f.max.Load()
-		if current <= max || f.max.CompareAndSwap(max, current) {
+		currentMax := f.max.Load()
+		if current <= currentMax || f.max.CompareAndSwap(currentMax, current) {
 			break
 		}
 	}
 
 	left, right := net.Pipe()
+
 	go func() {
 		time.Sleep(f.delay)
 		f.active.Add(-1)
+
 		_ = right.Close()
 	}()
+
 	return left, nil
 }
 
@@ -592,41 +683,53 @@ func TestSocksServerAllowsConcurrentClients(t *testing.T) {
 
 	runClient := func() error {
 		client, conn := net.Pipe()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		done := make(chan struct{})
+
 		go func() {
 			server.handleConn(conn)
 			close(done)
 		}()
 
-		if _, err := client.Write([]byte{socksVersion5, 0x01, socksAuthNoAuth}); err != nil {
+		_, err := client.Write([]byte{socksVersion5, 0x01, socksAuthNoAuth})
+		if err != nil {
 			return err
 		}
 
 		reply := make([]byte, 12)
-		if _, err := io.ReadFull(client, reply[:2]); err != nil {
+
+		_, err = io.ReadFull(client, reply[:2])
+		if err != nil {
 			return err
 		}
+
 		if !bytes.Equal(reply[:2], []byte{socksVersion5, socksAuthNoAuth}) {
 			return errors.New("unexpected auth reply")
 		}
-		if _, err := client.Write([]byte{
+
+		_, err = client.Write([]byte{
 			socksVersion5, socksCmdConnect, 0x00, socksAtypDomain, 0x0b,
 			'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm',
 			0x01, 0xbb,
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		}
-		if _, err := io.ReadFull(client, reply[:10]); err != nil {
+
+		_, err = io.ReadFull(client, reply[:10])
+		if err != nil {
 			return err
 		}
+
 		if reply[1] != socksReplySuccess {
 			return errors.New("unexpected connect reply")
 		}
 
 		_ = client.Close()
+
 		<-done
+
 		return nil
 	}
 
@@ -634,13 +737,14 @@ func TestSocksServerAllowsConcurrentClients(t *testing.T) {
 	go func() { errCh <- runClient() }()
 	go func() { errCh <- runClient() }()
 
-	for i := 0; i < 2; i++ {
-		if err := <-errCh; err != nil {
+	for i := range 2 {
+		err := <-errCh
+		if err != nil {
 			t.Fatalf("client %d failed: %v", i, err)
 		}
 	}
 
-	opener := server.upstream.(*fakeTunnelOpener)
+	opener := server.upstream.(*fakeTunnelOpener) //nolint:forcetypeassert // the concrete type is assigned directly above
 	if opener.max.Load() < 2 {
 		t.Fatalf("expected concurrent tunnel opens, max=%d", opener.max.Load())
 	}
@@ -653,9 +757,10 @@ func TestSocksServerRejectsWhenConnectionLimitReached(t *testing.T) {
 	server.connSlots <- struct{}{}
 
 	client, conn := net.Pipe()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	done := make(chan struct{})
+
 	go func() {
 		server.handleConn(conn)
 		close(done)
@@ -668,7 +773,9 @@ func TestSocksServerRejectsWhenConnectionLimitReached(t *testing.T) {
 	}
 
 	buf := make([]byte, 1)
-	if _, err := client.Read(buf); err == nil {
+
+	_, err := client.Read(buf)
+	if err == nil {
 		t.Fatal("expected client side to observe closed connection")
 	}
 }
@@ -677,10 +784,12 @@ func TestSocksServerHandshakeTimeout(t *testing.T) {
 	t.Parallel()
 
 	server := &socksServer{handshakeTimeout: 20 * time.Millisecond}
+
 	client, conn := net.Pipe()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	done := make(chan struct{})
+
 	go func() {
 		server.handleConn(conn)
 		close(done)
@@ -707,50 +816,59 @@ type fakeProxySession struct {
 // for a session whose keepalive PING has failed.
 type mortalProxySession struct {
 	fakeProxySession
+
 	alive atomic.Bool
 }
 
 func newMortalProxySession() *mortalProxySession {
 	s := &mortalProxySession{}
 	s.alive.Store(true)
+
 	return s
 }
 
 func (s *mortalProxySession) IsAlive() bool { return s.alive.Load() }
 
-func (s *fakeProxySession) OpenTunnel(authority string) (net.Conn, error) {
+func (s *fakeProxySession) OpenTunnel(_ string) (net.Conn, error) {
 	s.openCount.Add(1)
+
 	if s.openErr != nil {
 		return nil, s.openErr
 	}
+
 	return &fakeNetConn{}, nil
 }
 
 func (s *fakeProxySession) Close() error {
 	s.closeCount.Add(1)
+
 	return nil
 }
 
 func (s *fakeProxySession) UpdateToken(token string) error {
 	s.updateCount.Add(1)
+
 	if s.updateErr != nil {
 		return s.updateErr
 	}
+
 	s.tokenMu.Lock()
 	s.token = token
 	s.tokenMu.Unlock()
+
 	return nil
 }
 
 func (s *fakeProxySession) currentToken() string {
 	s.tokenMu.Lock()
 	defer s.tokenMu.Unlock()
+
 	return s.token
 }
 
 type fakeNetConn struct{}
 
-func (c *fakeNetConn) Read(p []byte) (int, error)       { return 0, io.EOF }
+func (c *fakeNetConn) Read(_ []byte) (int, error)       { return 0, io.EOF }
 func (c *fakeNetConn) Write(p []byte) (int, error)      { return len(p), nil }
 func (c *fakeNetConn) Close() error                     { return nil }
 func (c *fakeNetConn) LocalAddr() net.Addr              { return tunnelAddr("fake") }
@@ -773,13 +891,16 @@ func (c *controlledNetConn) Read([]byte) (int, error) {
 	if c.readErr != nil {
 		return 0, c.readErr
 	}
+
 	<-c.closed
+
 	return 0, net.ErrClosed
 }
 
 func (c *controlledNetConn) Write(p []byte) (int, error) { return len(p), nil }
 func (c *controlledNetConn) Close() error {
 	c.once.Do(func() { close(c.closed) })
+
 	return nil
 }
 func (c *controlledNetConn) LocalAddr() net.Addr              { return tunnelAddr("controlled") }
@@ -794,6 +915,7 @@ func TestProxyBidirectionalClosesBothSidesOnCopyError(t *testing.T) {
 	client := newControlledNetConn(errors.New("client read failed"))
 	upstream := newControlledNetConn(nil)
 	done := make(chan struct{})
+
 	go func() {
 		proxyBidirectional(client, upstream, 0)
 		close(done)
@@ -804,6 +926,7 @@ func TestProxyBidirectionalClosesBothSidesOnCopyError(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("proxyBidirectional did not close the blocked peer after copy error")
 	}
+
 	select {
 	case <-upstream.closed:
 	default:
@@ -813,17 +936,22 @@ func TestProxyBidirectionalClosesBothSidesOnCopyError(t *testing.T) {
 
 type fakeHalfCloseConn struct {
 	fakeNetConn
+
 	closeReadCount  atomic.Int32
 	closeWriteCount atomic.Int32
 }
 
+//nolint:unparam // the error return is required by the net.Conn half-close contract under test
 func (c *fakeHalfCloseConn) CloseRead() error {
 	c.closeReadCount.Add(1)
+
 	return nil
 }
 
+//nolint:unparam // the error return is required by the net.Conn half-close contract under test
 func (c *fakeHalfCloseConn) CloseWrite() error {
 	c.closeWriteCount.Add(1)
+
 	return nil
 }
 
@@ -864,42 +992,57 @@ func TestTunnelWrappersForwardHalfCloseAndReleaseOnClose(t *testing.T) {
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
 			underlying := &fakeHalfCloseConn{}
+
 			var releaseCount atomic.Int32
-			conn := tc.conn(underlying, &releaseCount)
+
+			conn := testCase.conn(underlying, &releaseCount)
 
 			assertHalfCloseForwarding(t, conn, underlying, &releaseCount)
 		})
 	}
 }
 
-func assertHalfCloseForwarding(t *testing.T, conn halfCloseTestConn, underlying *fakeHalfCloseConn, releaseCount *atomic.Int32) {
+func assertHalfCloseForwarding(
+	t *testing.T,
+	conn halfCloseTestConn,
+	underlying *fakeHalfCloseConn,
+	releaseCount *atomic.Int32,
+) {
 	t.Helper()
 
-	if err := conn.CloseWrite(); err != nil {
+	err := conn.CloseWrite()
+	if err != nil {
 		t.Fatalf("CloseWrite returned error: %v", err)
 	}
+
 	if got := underlying.closeWriteCount.Load(); got != 1 {
 		t.Fatalf("expected underlying CloseWrite once, got %d", got)
 	}
 
-	if err := conn.CloseRead(); err != nil {
+	err = conn.CloseRead()
+	if err != nil {
 		t.Fatalf("CloseRead returned error: %v", err)
 	}
+
 	if got := underlying.closeReadCount.Load(); got != 1 {
 		t.Fatalf("expected underlying CloseRead once, got %d", got)
 	}
 
-	if err := conn.Close(); err != nil {
+	err = conn.Close()
+	if err != nil {
 		t.Fatalf("Close returned error: %v", err)
 	}
-	if err := conn.Close(); err != nil {
+
+	err = conn.Close()
+	if err != nil {
 		t.Fatalf("second Close returned error: %v", err)
 	}
+
 	if got := releaseCount.Load(); got != 1 {
 		t.Fatalf("expected pooled session release once, got %d", got)
 	}
@@ -909,21 +1052,26 @@ func TestProxySessionPoolDistributesTunnels(t *testing.T) {
 	t.Parallel()
 
 	sessions := []*fakeProxySession{{}, {}, {}}
+
 	var created atomic.Int32
+
 	pool, err := newProxySessionPool(len(sessions), func() (proxySession, error) {
 		idx := int(created.Add(1)) - 1
+
 		return sessions[idx], nil
 	})
 	if err != nil {
 		t.Fatalf("newProxySessionPool returned error: %v", err)
 	}
-	defer pool.Close()
 
-	for i := 0; i < 6; i++ {
+	defer func() { _ = pool.Close() }()
+
+	for i := range 6 {
 		conn, err := pool.OpenTunnel("example.com:443")
 		if err != nil {
 			t.Fatalf("OpenTunnel %d returned error: %v", i, err)
 		}
+
 		_ = conn.Close()
 	}
 
@@ -939,8 +1087,11 @@ func TestProxySessionPoolSkipsAndReplacesDeadSession(t *testing.T) {
 
 	dead := newMortalProxySession()
 	live := newMortalProxySession()
+
 	var created atomic.Int32
+
 	replacement := newMortalProxySession()
+
 	pool, err := newProxySessionPool(2, func() (proxySession, error) {
 		switch created.Add(1) {
 		case 1:
@@ -954,22 +1105,25 @@ func TestProxySessionPoolSkipsAndReplacesDeadSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newProxySessionPool returned error: %v", err)
 	}
-	defer pool.Close()
+
+	defer func() { _ = pool.Close() }()
 
 	// The keepalive notices the first session died while idle.
 	dead.alive.Store(false)
 
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		conn, err := pool.OpenTunnel("example.com:443")
 		if err != nil {
 			t.Fatalf("OpenTunnel %d returned error: %v", i, err)
 		}
+
 		_ = conn.Close()
 	}
 
 	if got := dead.openCount.Load(); got != 0 {
 		t.Fatalf("expected no tunnels on the dead session, got %d", got)
 	}
+
 	waitForCondition(t, 2*time.Second, func() bool {
 		return created.Load() >= 3
 	})
@@ -983,7 +1137,9 @@ func TestProxyControllerRebuildsKeepAliveDeadSession(t *testing.T) {
 
 	dead := newMortalProxySession()
 	fresh := newMortalProxySession()
+
 	var created atomic.Int32
+
 	controller := &proxyController{
 		current: &managedSession{
 			session:   dead,
@@ -994,22 +1150,27 @@ func TestProxyControllerRebuildsKeepAliveDeadSession(t *testing.T) {
 	controller.refreshSession = func() error {
 		created.Add(1)
 		controller.swapSession(fresh, "fresh-token", time.Now().Add(20*time.Minute))
+
 		return nil
 	}
+
 	dead.alive.Store(false)
 
 	conn, err := controller.OpenTunnel("example.com:443")
 	if err != nil {
 		t.Fatalf("OpenTunnel returned error: %v", err)
 	}
-	defer conn.Close()
+
+	defer func() { _ = conn.Close() }()
 
 	if got := dead.openCount.Load(); got != 0 {
 		t.Fatalf("expected no tunnel attempt on the dead session, got %d", got)
 	}
+
 	if got := fresh.openCount.Load(); got != 1 {
 		t.Fatalf("expected the rebuilt session to serve the tunnel, got %d", got)
 	}
+
 	if got := created.Load(); got != 1 {
 		t.Fatalf("expected exactly one rebuild, got %d", got)
 	}
@@ -1019,36 +1180,44 @@ func TestProxySessionPoolPinsClientToOneSession(t *testing.T) {
 	t.Parallel()
 
 	sessions := []*fakeProxySession{{}, {}, {}}
+
 	var created atomic.Int32
-	p, err := newProxySessionPool(len(sessions), func() (proxySession, error) {
+
+	pool, err := newProxySessionPool(len(sessions), func() (proxySession, error) {
 		idx := int(created.Add(1)) - 1
 		if idx >= len(sessions) {
 			return nil, errors.New("replacement unavailable")
 		}
+
 		return sessions[idx], nil
 	})
 	if err != nil {
 		t.Fatalf("newProxySessionPool returned error: %v", err)
 	}
-	defer p.Close()
 
-	for i := 0; i < 6; i++ {
-		conn, err := p.OpenTunnelForClient("example.com:443", "127.0.0.1")
+	defer func() { _ = pool.Close() }()
+
+	for i := range 6 {
+		conn, err := pool.OpenTunnelForClient("example.com:443", "127.0.0.1")
 		if err != nil {
 			t.Fatalf("OpenTunnelForClient %d returned error: %v", i, err)
 		}
+
 		_ = conn.Close()
 	}
 
 	used := 0
+
 	for i, session := range sessions {
 		if got := session.openCount.Load(); got > 0 {
 			used++
+
 			if got != 6 {
 				t.Fatalf("expected pinned session %d to receive all tunnels, got %d", i, got)
 			}
 		}
 	}
+
 	if used != 1 {
 		t.Fatalf("expected one session to receive pinned client tunnels, used %d", used)
 	}
@@ -1058,39 +1227,47 @@ func TestProxySessionPoolKeepsClientOnFailoverSession(t *testing.T) {
 	t.Parallel()
 
 	sessions := []*fakeProxySession{{}, {}, {}}
+
 	var created atomic.Int32
-	p, err := newProxySessionPool(len(sessions), func() (proxySession, error) {
+
+	pool, err := newProxySessionPool(len(sessions), func() (proxySession, error) {
 		idx := int(created.Add(1)) - 1
 		if idx >= len(sessions) {
 			return nil, errors.New("replacement unavailable")
 		}
+
 		return sessions[idx], nil
 	})
 	if err != nil {
 		t.Fatalf("newProxySessionPool returned error: %v", err)
 	}
-	defer p.Close()
+
+	defer func() { _ = pool.Close() }()
 
 	const clientKey = "127.0.0.1"
-	failedSlot := p.nextSlot(clientKey)
+
+	failedSlot := pool.nextSlot(clientKey)
 	failoverSlot := (failedSlot + 1) % len(sessions)
 	sessions[failedSlot].openErr = errors.New("transport closed")
 
-	conn, err := p.OpenTunnelForClient("example.com:443", clientKey)
+	conn, err := pool.OpenTunnelForClient("example.com:443", clientKey)
 	if err != nil {
 		t.Fatalf("OpenTunnelForClient failover returned error: %v", err)
 	}
+
 	_ = conn.Close()
 
-	conn, err = p.OpenTunnelForClient("example.org:443", clientKey)
+	conn, err = pool.OpenTunnelForClient("example.org:443", clientKey)
 	if err != nil {
 		t.Fatalf("OpenTunnelForClient after failover returned error: %v", err)
 	}
+
 	_ = conn.Close()
 
 	if got := sessions[failedSlot].openCount.Load(); got != 1 {
 		t.Fatalf("expected failed slot to be tried once, got %d", got)
 	}
+
 	if got := sessions[failoverSlot].openCount.Load(); got != 2 {
 		t.Fatalf("expected failover slot to remain sticky, got %d opens", got)
 	}
@@ -1100,13 +1277,18 @@ func TestProxySessionPoolUpdatesExistingAndReplacementTokens(t *testing.T) {
 	t.Parallel()
 
 	var factoryMu sync.Mutex
-	createToken := "old-token"
+
+	createToken := fixtureTokenOld
+
 	var sessions []*fakeProxySession
-	p, err := newProxySessionPool(2, func() (proxySession, error) {
+
+	pool, err := newProxySessionPool(2, func() (proxySession, error) {
 		factoryMu.Lock()
 		defer factoryMu.Unlock()
+
 		session := &fakeProxySession{token: createToken}
 		sessions = append(sessions, session)
+
 		return session, nil
 	}, func(token string) {
 		factoryMu.Lock()
@@ -1116,31 +1298,38 @@ func TestProxySessionPoolUpdatesExistingAndReplacementTokens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newProxySessionPool returned error: %v", err)
 	}
-	defer p.Close()
 
-	if err := p.UpdateToken("new-token"); err != nil {
+	defer func() { _ = pool.Close() }()
+
+	err = pool.UpdateToken(fixtureTokenNew)
+	if err != nil {
 		t.Fatalf("UpdateToken returned error: %v", err)
 	}
+
 	factoryMu.Lock()
+
 	initial := append([]*fakeProxySession(nil), sessions...)
 	factoryMu.Unlock()
+
 	for i, session := range initial {
-		if got := session.currentToken(); got != "new-token" {
+		if got := session.currentToken(); got != fixtureTokenNew {
 			t.Fatalf("expected existing session %d token to update, got %q", i, got)
 		}
 	}
 
-	failed := p.slot(0)
-	p.retireSlot(0, failed)
+	failed := pool.slot(0)
+	pool.retireSlot(0, failed)
 	waitForCondition(t, time.Second, func() bool {
 		factoryMu.Lock()
 		defer factoryMu.Unlock()
+
 		return len(sessions) >= 3
 	})
 	factoryMu.Lock()
 	replacement := sessions[len(sessions)-1]
 	factoryMu.Unlock()
-	if got := replacement.currentToken(); got != "new-token" {
+
+	if got := replacement.currentToken(); got != fixtureTokenNew {
 		t.Fatalf("expected replacement session to use renewed token, got %q", got)
 	}
 }
@@ -1149,27 +1338,36 @@ func TestProxySessionPoolUpdatesReplacementCreatedDuringRenewal(t *testing.T) {
 	t.Parallel()
 
 	var factoryMu sync.Mutex
-	createToken := "old-token"
+
+	createToken := fixtureTokenOld
 	createCalls := 0
 	replacementStarted := make(chan struct{})
 	releaseReplacement := make(chan struct{})
+
 	var releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(releaseReplacement) })
+
 	var sessions []*fakeProxySession
-	p, err := newProxySessionPool(2, func() (proxySession, error) {
+
+	pool, err := newProxySessionPool(2, func() (proxySession, error) {
 		factoryMu.Lock()
 		createCalls++
 		call := createCalls
 		token := createToken
 		factoryMu.Unlock()
+
 		if call == 3 {
 			close(replacementStarted)
 			<-releaseReplacement
 		}
+
 		session := &fakeProxySession{token: token}
+
 		factoryMu.Lock()
+
 		sessions = append(sessions, session)
 		factoryMu.Unlock()
+
 		return session, nil
 	}, func(token string) {
 		factoryMu.Lock()
@@ -1179,24 +1377,30 @@ func TestProxySessionPoolUpdatesReplacementCreatedDuringRenewal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newProxySessionPool returned error: %v", err)
 	}
-	defer p.Close()
 
-	p.retireSlot(0, p.slot(0))
+	defer func() { _ = pool.Close() }()
+
+	pool.retireSlot(0, pool.slot(0))
+
 	select {
 	case <-replacementStarted:
 	case <-time.After(time.Second):
 		t.Fatal("replacement session creation did not start")
 	}
-	if err := p.UpdateToken("new-token"); err != nil {
+
+	err = pool.UpdateToken(fixtureTokenNew)
+	if err != nil {
 		t.Fatalf("UpdateToken returned error: %v", err)
 	}
+
 	releaseOnce.Do(func() { close(releaseReplacement) })
-	waitForCondition(t, time.Second, func() bool { return p.slot(0) != nil })
+	waitForCondition(t, time.Second, func() bool { return pool.slot(0) != nil })
 
 	factoryMu.Lock()
 	replacement := sessions[len(sessions)-1]
 	factoryMu.Unlock()
-	if got := replacement.currentToken(); got != "new-token" {
+
+	if got := replacement.currentToken(); got != fixtureTokenNew {
 		t.Fatalf("expected in-flight replacement to receive renewed token, got %q", got)
 	}
 }
@@ -1208,28 +1412,36 @@ func TestProxySessionPoolSkipsBrokenSession(t *testing.T) {
 	healthy := &fakeProxySession{}
 	replacement := &fakeProxySession{}
 	sessions := []*fakeProxySession{broken, healthy, replacement}
+
 	var created atomic.Int32
+
 	pool, err := newProxySessionPool(2, func() (proxySession, error) {
 		idx := int(created.Add(1)) - 1
+
 		return sessions[idx], nil
 	})
 	if err != nil {
 		t.Fatalf("newProxySessionPool returned error: %v", err)
 	}
-	defer pool.Close()
+
+	defer func() { _ = pool.Close() }()
 
 	conn, err := pool.OpenTunnel("example.com:443")
 	if err != nil {
 		t.Fatalf("OpenTunnel returned error: %v", err)
 	}
+
 	_ = conn.Close()
 
 	if got := healthy.openCount.Load(); got != 1 {
 		t.Fatalf("expected healthy session open count 1, got %d", got)
 	}
-	if err := pool.Close(); err != nil {
+
+	err = pool.Close()
+	if err != nil {
 		t.Fatalf("pool Close returned error: %v", err)
 	}
+
 	if got := broken.closeCount.Load(); got != 1 {
 		t.Fatalf("expected broken session to be closed once, got %d", got)
 	}
@@ -1239,24 +1451,30 @@ func TestProxySessionPoolStartsWithPartialSuccess(t *testing.T) {
 	t.Parallel()
 
 	session := &fakeProxySession{}
+
 	var attempts atomic.Int32
+
 	pool, err := newProxySessionPool(3, func() (proxySession, error) {
 		n := attempts.Add(1)
 		if n == 1 {
 			return session, nil
 		}
+
 		return nil, errors.New("temporary dial failure")
 	})
 	if err != nil {
 		t.Fatalf("newProxySessionPool returned error: %v", err)
 	}
-	defer pool.Close()
+
+	defer func() { _ = pool.Close() }()
 
 	conn, err := pool.OpenTunnel("example.com:443")
 	if err != nil {
 		t.Fatalf("OpenTunnel returned error: %v", err)
 	}
+
 	_ = conn.Close()
+
 	if got := session.openCount.Load(); got != 1 {
 		t.Fatalf("expected available session open count 1, got %d", got)
 	}
@@ -1269,36 +1487,43 @@ func TestProxySessionPoolReplenishesBrokenSession(t *testing.T) {
 	healthy := &fakeProxySession{}
 	replacement := &fakeProxySession{}
 	sessions := []*fakeProxySession{broken, healthy, replacement}
+
 	var created atomic.Int32
+
 	pool, err := newProxySessionPool(2, func() (proxySession, error) {
 		idx := int(created.Add(1)) - 1
 		if idx >= len(sessions) {
 			return nil, errors.New("unexpected extra create")
 		}
+
 		return sessions[idx], nil
 	})
 	if err != nil {
 		t.Fatalf("newProxySessionPool returned error: %v", err)
 	}
-	defer pool.Close()
+
+	defer func() { _ = pool.Close() }()
 
 	conn, err := pool.OpenTunnel("example.com:443")
 	if err != nil {
 		t.Fatalf("OpenTunnel returned error: %v", err)
 	}
+
 	_ = conn.Close()
 
 	waitForCondition(t, time.Second, func() bool {
 		return pool.slot(0) != nil
 	})
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		conn, err := pool.OpenTunnel("example.org:443")
 		if err != nil {
 			t.Fatalf("OpenTunnel after replenish returned error: %v", err)
 		}
+
 		_ = conn.Close()
 	}
+
 	if got := replacement.openCount.Load(); got == 0 {
 		t.Fatal("expected replenished session to receive a tunnel")
 	}
@@ -1306,42 +1531,54 @@ func TestProxySessionPoolReplenishesBrokenSession(t *testing.T) {
 
 func waitForCondition(t *testing.T, timeout time.Duration, ok func() bool) {
 	t.Helper()
+
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if ok() {
 			return
 		}
+
 		time.Sleep(10 * time.Millisecond)
 	}
+
 	t.Fatal("condition was not met before timeout")
 }
 
 func TestTunnelWriteBufferRoundTripsAcrossWraparound(t *testing.T) {
 	t.Parallel()
 
-	b := newTunnelWriteBuffer(8)
+	buffer := newTunnelWriteBuffer(8)
 	payload := []byte("0123456789abcdefghij")
 
 	done := make(chan error, 1)
+
 	go func() {
-		_, err := b.Write(payload)
+		_, err := buffer.Write(payload)
 		done <- err
-		_ = b.Close()
+
+		_ = buffer.Close()
 	}()
 
 	got := make([]byte, 0, len(payload))
+
 	buf := make([]byte, 5)
+
 	for len(got) < len(payload) {
-		n, err := b.Read(buf)
+		n, err := buffer.Read(buf)
+
 		got = append(got, buf[:n]...)
+
 		if err != nil {
 			t.Fatalf("Read returned error after %d bytes: %v", len(got), err)
 		}
 	}
+
 	if string(got) != string(payload) {
 		t.Fatalf("expected %q, got %q", payload, got)
 	}
-	if err := <-done; err != nil {
+
+	err := <-done
+	if err != nil {
 		t.Fatalf("Write returned error: %v", err)
 	}
 }
@@ -1349,11 +1586,15 @@ func TestTunnelWriteBufferRoundTripsAcrossWraparound(t *testing.T) {
 func TestTunnelWriteBufferWriteDoesNotBlockUntilFull(t *testing.T) {
 	t.Parallel()
 
-	b := newTunnelWriteBuffer(16)
+	buffer := newTunnelWriteBuffer(16)
+
 	done := make(chan struct{})
+
 	go func() {
 		defer close(done)
-		if _, err := b.Write([]byte("0123456789")); err != nil {
+
+		_, err := buffer.Write([]byte("0123456789"))
+		if err != nil {
 			t.Errorf("Write returned error: %v", err)
 		}
 	}()
@@ -1368,23 +1609,31 @@ func TestTunnelWriteBufferWriteDoesNotBlockUntilFull(t *testing.T) {
 func TestTunnelWriteBufferCloseKeepsBufferedDataReadable(t *testing.T) {
 	t.Parallel()
 
-	b := newTunnelWriteBuffer(16)
-	if _, err := b.Write([]byte("tail")); err != nil {
+	buffer := newTunnelWriteBuffer(16)
+
+	_, err := buffer.Write([]byte("tail"))
+	if err != nil {
 		t.Fatalf("Write returned error: %v", err)
 	}
-	if err := b.Close(); err != nil {
+
+	err = buffer.Close()
+	if err != nil {
 		t.Fatalf("Close returned error: %v", err)
 	}
 
 	buf := make([]byte, 8)
-	n, err := b.Read(buf)
+
+	readCount, err := buffer.Read(buf)
 	if err != nil {
 		t.Fatalf("Read returned error: %v", err)
 	}
-	if string(buf[:n]) != "tail" {
-		t.Fatalf("expected buffered data to survive Close, got %q", buf[:n])
+
+	if string(buf[:readCount]) != "tail" {
+		t.Fatalf("expected buffered data to survive Close, got %q", buf[:readCount])
 	}
-	if _, err := b.Read(buf); !errors.Is(err, io.EOF) {
+
+	_, err = buffer.Read(buf)
+	if !errors.Is(err, io.EOF) {
 		t.Fatalf("expected EOF once drained, got %v", err)
 	}
 }
@@ -1392,16 +1641,17 @@ func TestTunnelWriteBufferCloseKeepsBufferedDataReadable(t *testing.T) {
 func TestTunnelWriteBufferFailReadUnblocksBlockedWriter(t *testing.T) {
 	t.Parallel()
 
-	b := newTunnelWriteBuffer(4)
+	buffer := newTunnelWriteBuffer(4)
 	errCh := make(chan error, 1)
+
 	go func() {
-		_, err := b.Write([]byte("far more than four bytes"))
+		_, err := buffer.Write([]byte("far more than four bytes"))
 		errCh <- err
 	}()
 
 	// Let the writer fill the buffer and block on notFull.
 	time.Sleep(50 * time.Millisecond)
-	b.failRead(io.ErrClosedPipe)
+	buffer.failRead(io.ErrClosedPipe)
 
 	select {
 	case err := <-errCh:
@@ -1424,16 +1674,20 @@ func TestTunnelConnCloseWriteClosesRequestBody(t *testing.T) {
 		name:    "test-tunnel",
 	}
 
-	if err := conn.CloseWrite(); err != nil {
+	err := conn.CloseWrite()
+	if err != nil {
 		t.Fatalf("CloseWrite returned error: %v", err)
 	}
 
 	buf := make([]byte, 1)
-	if _, err := reqBody.Read(buf); !errors.Is(err, io.EOF) {
+
+	_, err = reqBody.Read(buf)
+	if !errors.Is(err, io.EOF) {
 		t.Fatalf("expected request body EOF after CloseWrite, got %v", err)
 	}
 
-	if err := conn.Close(); err != nil {
+	err = conn.Close()
+	if err != nil {
 		t.Fatalf("Close returned error: %v", err)
 	}
 }
@@ -1449,9 +1703,11 @@ func TestTunnelConnCloseCancelsRequestContext(t *testing.T) {
 		name:   "test-tunnel",
 	}
 
-	if err := conn.Close(); err != nil {
+	err := conn.Close()
+	if err != nil {
 		t.Fatalf("Close returned error: %v", err)
 	}
+
 	select {
 	case <-ctx.Done():
 	case <-time.After(time.Second):
@@ -1466,9 +1722,11 @@ func TestTunnelConnDeadlineUnsupported(t *testing.T) {
 	if !errors.Is(conn.SetDeadline(time.Now()), errTunnelDeadline) {
 		t.Fatal("expected SetDeadline to report unsupported tunnel deadline")
 	}
+
 	if !errors.Is(conn.SetReadDeadline(time.Now()), errTunnelDeadline) {
 		t.Fatal("expected SetReadDeadline to report unsupported tunnel deadline")
 	}
+
 	if !errors.Is(conn.SetWriteDeadline(time.Now()), errTunnelDeadline) {
 		t.Fatal("expected SetWriteDeadline to report unsupported tunnel deadline")
 	}
@@ -1477,19 +1735,25 @@ func TestTunnelConnDeadlineUnsupported(t *testing.T) {
 func TestProxySessionsUpdateBearerToken(t *testing.T) {
 	t.Parallel()
 
-	h2Session := &h2ProxySession{token: "old-token"}
-	if err := h2Session.UpdateToken("new-token"); err != nil {
+	h2Session := &h2ProxySession{token: fixtureTokenOld}
+
+	err := h2Session.UpdateToken(fixtureTokenNew)
+	if err != nil {
 		t.Fatalf("h2 UpdateToken returned error: %v", err)
 	}
-	if got := h2Session.bearerToken(); got != "new-token" {
+
+	if got := h2Session.bearerToken(); got != fixtureTokenNew {
 		t.Fatalf("expected h2 token update, got %q", got)
 	}
 
-	h3Session := &h3ProxySession{token: "old-token"}
-	if err := h3Session.UpdateToken("new-token"); err != nil {
+	h3Session := &h3ProxySession{token: fixtureTokenOld}
+
+	err = h3Session.UpdateToken(fixtureTokenNew)
+	if err != nil {
 		t.Fatalf("h3 UpdateToken returned error: %v", err)
 	}
-	if got := h3Session.bearerToken(); got != "new-token" {
+
+	if got := h3Session.bearerToken(); got != fixtureTokenNew {
 		t.Fatalf("expected h3 token update, got %q", got)
 	}
 }
@@ -1497,11 +1761,16 @@ func TestProxySessionsUpdateBearerToken(t *testing.T) {
 func TestRoundTripWithOpenTimeout(t *testing.T) {
 	t.Parallel()
 
-	_, _, err := roundTripWithOpenTimeout(20*time.Millisecond, func(ctx context.Context) (*http.Response, error) {
-		<-ctx.Done()
-		return nil, ctx.Err()
-	})
+	// No response body is ever produced on this path.
+	_, _, err := roundTripWithOpenTimeout(20*time.Millisecond, //nolint:bodyclose // the closure never returns a body
+		func(ctx context.Context) (*http.Response, error) {
+			<-ctx.Done()
+
+			return nil, ctx.Err()
+		})
+
 	var timeoutErr *tunnelOpenTimeoutError
+
 	if !errors.As(err, &timeoutErr) {
 		t.Fatalf("expected tunnelOpenTimeoutError, got %v", err)
 	}
@@ -1510,15 +1779,21 @@ func TestRoundTripWithOpenTimeout(t *testing.T) {
 func TestShouldRebuildProxySession(t *testing.T) {
 	t.Parallel()
 
-	if shouldRebuildProxySession(&proxyConnectHTTPError{statusCode: http.StatusBadGateway, status: "502 Bad Gateway"}) {
+	if shouldRebuildProxySession(&proxyConnectHTTPError{statusCode: http.StatusBadGateway, status: fixtureBadGateway}) {
 		t.Fatal("expected target/proxy CONNECT 502 to avoid session rebuild")
 	}
-	if !shouldRebuildProxySession(&proxyConnectHTTPError{statusCode: http.StatusProxyAuthRequired, status: "407 Proxy Authentication Required"}) {
+
+	if !shouldRebuildProxySession(&proxyConnectHTTPError{
+		statusCode: http.StatusProxyAuthRequired,
+		status:     "407 Proxy Authentication Required",
+	}) {
 		t.Fatal("expected proxy auth failure to rebuild session")
 	}
+
 	if shouldRebuildProxySession(&tunnelOpenTimeoutError{timeout: time.Second}) {
 		t.Fatal("expected CONNECT timeout to avoid session rebuild")
 	}
+
 	if !shouldRebuildProxySession(errors.New("transport closed")) {
 		t.Fatal("expected transport errors to rebuild session")
 	}
@@ -1528,48 +1803,66 @@ func TestSessionFailureTrackerRequiresDistinctTargets(t *testing.T) {
 	t.Parallel()
 
 	tracker := &sessionFailureTracker{}
+
 	timeoutErr := &tunnelOpenTimeoutError{timeout: time.Second}
-	for i := 0; i < 5; i++ {
-		if err := tracker.observe("same.example:443", timeoutErr); errors.Is(err, errProxySessionUnhealthy) {
+
+	for range 5 {
+		err := tracker.observe("same.example:443", timeoutErr)
+		if errors.Is(err, errProxySessionUnhealthy) {
 			t.Fatal("repeated failure for one target should not retire the session")
 		}
 	}
-	if err := tracker.observe("second.example:443", timeoutErr); errors.Is(err, errProxySessionUnhealthy) {
+
+	err := tracker.observe("second.example:443", timeoutErr)
+	if errors.Is(err, errProxySessionUnhealthy) {
 		t.Fatal("two failed targets should not retire the session")
 	}
-	if err := tracker.observe("third.example:443", timeoutErr); !errors.Is(err, errProxySessionUnhealthy) {
+
+	err = tracker.observe("third.example:443", timeoutErr)
+	if !errors.Is(err, errProxySessionUnhealthy) {
 		t.Fatalf("expected three distinct timeout targets to retire the session, got %v", err)
 	}
 
-	tracker.observe("healthy.example:443", nil)
-	badGateway := &proxyConnectHTTPError{statusCode: http.StatusBadGateway, status: "502 Bad Gateway"}
-	if err := tracker.observe("one.example:443", badGateway); errors.Is(err, errProxySessionUnhealthy) {
+	_ = tracker.observe("healthy.example:443", nil)
+
+	badGateway := &proxyConnectHTTPError{statusCode: http.StatusBadGateway, status: fixtureBadGateway}
+
+	err = tracker.observe("one.example:443", badGateway)
+	if errors.Is(err, errProxySessionUnhealthy) {
 		t.Fatal("one 502 target should not retire the session")
 	}
-	if err := tracker.observe("two.example:443", badGateway); errors.Is(err, errProxySessionUnhealthy) {
+
+	err = tracker.observe("two.example:443", badGateway)
+	if errors.Is(err, errProxySessionUnhealthy) {
 		t.Fatal("two 502 targets should not retire the session")
 	}
-	if err := tracker.observe("three.example:443", badGateway); !errors.Is(err, errProxySessionUnhealthy) {
+
+	err = tracker.observe("three.example:443", badGateway)
+	if !errors.Is(err, errProxySessionUnhealthy) {
 		t.Fatalf("expected three distinct 502 targets to retire the session, got %v", err)
 	}
 }
 
+//nolint:paralleltest // mutates the package-global verboseLogs flag; parallel execution would race
 func TestLogErrRedactsConnectHTTPBodyUnlessVerbose(t *testing.T) {
 	previous := verboseLogs
+
 	t.Cleanup(func() { verboseLogs = previous })
 
 	err := &proxyConnectHTTPError{
 		statusCode: http.StatusBadGateway,
-		status:     "502 Bad Gateway",
+		status:     fixtureBadGateway,
 		body:       "target example.com failed",
 	}
 
 	verboseLogs = false
+
 	if got := logErr(err); strings.Contains(got, "example.com") {
 		t.Fatalf("expected default log error to redact CONNECT body, got %q", got)
 	}
 
 	verboseLogs = true
+
 	if got := logErr(err); !strings.Contains(got, "example.com") {
 		t.Fatalf("expected verbose log error to keep CONNECT body, got %q", got)
 	}
@@ -1592,29 +1885,34 @@ func TestProxyControllerSwapDrainsOldSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenTunnel old session failed: %v", err)
 	}
+
 	if oldSession.openCount.Load() != 1 {
 		t.Fatalf("expected old session open count 1, got %d", oldSession.openCount.Load())
 	}
 
-	controller.swapSession(newSession, "new-token", time.Now().Add(20*time.Minute))
+	controller.swapSession(newSession, fixtureTokenNew, time.Now().Add(20*time.Minute))
 
 	conn2, err := controller.OpenTunnel("example.org:443")
 	if err != nil {
 		t.Fatalf("OpenTunnel new session failed: %v", err)
 	}
+
 	if newSession.openCount.Load() != 1 {
 		t.Fatalf("expected new session open count 1, got %d", newSession.openCount.Load())
 	}
+
 	if oldSession.closeCount.Load() != 0 {
 		t.Fatalf("old session closed too early: %d", oldSession.closeCount.Load())
 	}
 
 	_ = conn2.Close()
+
 	if newSession.closeCount.Load() != 0 {
 		t.Fatalf("new current session should remain open, got close count %d", newSession.closeCount.Load())
 	}
 
 	_ = conn1.Close()
+
 	if oldSession.closeCount.Load() != 1 {
 		t.Fatalf("expected old session to close after draining, got %d", oldSession.closeCount.Load())
 	}
@@ -1623,7 +1921,7 @@ func TestProxyControllerSwapDrainsOldSession(t *testing.T) {
 func TestProxyControllerUpdatesTokenWithoutReplacingSession(t *testing.T) {
 	t.Parallel()
 
-	session := &fakeProxySession{token: "old-token"}
+	session := &fakeProxySession{token: fixtureTokenOld}
 	oldExpiry := time.Now().Add(10 * time.Minute)
 	newExpiry := time.Now().Add(20 * time.Minute)
 	controller := &proxyController{
@@ -1634,18 +1932,23 @@ func TestProxyControllerUpdatesTokenWithoutReplacingSession(t *testing.T) {
 		},
 	}
 
-	if err := controller.updateCurrentSessionToken("new-token", newExpiry); err != nil {
+	err := controller.updateCurrentSessionToken(fixtureTokenNew, newExpiry)
+	if err != nil {
 		t.Fatalf("updateCurrentSessionToken returned error: %v", err)
 	}
+
 	if controller.current.session != session {
 		t.Fatal("expected token renewal to retain the existing upstream session")
 	}
-	if got := session.currentToken(); got != "new-token" {
+
+	if got := session.currentToken(); got != fixtureTokenNew {
 		t.Fatalf("expected renewed token, got %q", got)
 	}
+
 	if !controller.current.expiresAt.Equal(newExpiry) {
 		t.Fatalf("expected expiry %s, got %s", newExpiry, controller.current.expiresAt)
 	}
+
 	if session.closeCount.Load() != 0 {
 		t.Fatalf("expected retained session to stay open, got %d closes", session.closeCount.Load())
 	}
@@ -1655,10 +1958,13 @@ func TestProxyControllerRejectsSessionSwapAfterClose(t *testing.T) {
 	t.Parallel()
 
 	controller := &proxyController{closed: true}
+
 	newSession := &fakeProxySession{}
-	if controller.swapSession(newSession, "new-token", time.Now().Add(time.Minute)) {
+
+	if controller.swapSession(newSession, fixtureTokenNew, time.Now().Add(time.Minute)) {
 		t.Fatal("expected closed controller to reject session swap")
 	}
+
 	if got := newSession.closeCount.Load(); got != 1 {
 		t.Fatalf("expected rejected session to be closed once, got %d", got)
 	}
@@ -1690,11 +1996,13 @@ func TestProxyControllerDisableExpiredSessionRejectsNewTunnels(t *testing.T) {
 	if !errors.Is(err, errNoUsableProxySession) {
 		t.Fatalf("expected errNoUsableProxySession, got %v", err)
 	}
+
 	if session.closeCount.Load() != 0 {
 		t.Fatalf("session closed while active tunnel exists: %d", session.closeCount.Load())
 	}
 
 	_ = conn.Close()
+
 	if session.closeCount.Load() != 1 {
 		t.Fatalf("expected session close after active tunnel drained, got %d", session.closeCount.Load())
 	}
@@ -1713,7 +2021,8 @@ func TestProxyControllerRebuildsSessionAfterOpenTunnelFailure(t *testing.T) {
 		},
 	}
 	controller.refreshSession = func() error {
-		controller.swapSession(newSession, "new-token", time.Now().Add(20*time.Minute))
+		controller.swapSession(newSession, fixtureTokenNew, time.Now().Add(20*time.Minute))
+
 		return nil
 	}
 
@@ -1721,14 +2030,17 @@ func TestProxyControllerRebuildsSessionAfterOpenTunnelFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenTunnel after rebuild failed: %v", err)
 	}
+
 	_ = conn.Close()
 
 	if failedSession.openCount.Load() != 1 {
 		t.Fatalf("expected failed session open count 1, got %d", failedSession.openCount.Load())
 	}
+
 	if failedSession.closeCount.Load() != 1 {
 		t.Fatalf("expected failed session to close after rebuild, got %d", failedSession.closeCount.Load())
 	}
+
 	if newSession.openCount.Load() != 1 {
 		t.Fatalf("expected new session open count 1, got %d", newSession.openCount.Load())
 	}
@@ -1740,7 +2052,7 @@ func TestProxyControllerDoesNotRebuildForConnectHTTPFailure(t *testing.T) {
 	session := &fakeProxySession{
 		openErr: &proxyConnectHTTPError{
 			statusCode: http.StatusBadGateway,
-			status:     "502 Bad Gateway",
+			status:     fixtureBadGateway,
 			body:       "target unreachable",
 		},
 	}
@@ -1751,9 +2063,12 @@ func TestProxyControllerDoesNotRebuildForConnectHTTPFailure(t *testing.T) {
 			accepting: true,
 		},
 	}
+
 	var rebuilds atomic.Int32
+
 	controller.refreshSession = func() error {
 		rebuilds.Add(1)
+
 		return nil
 	}
 
@@ -1761,16 +2076,20 @@ func TestProxyControllerDoesNotRebuildForConnectHTTPFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected OpenTunnel to fail")
 	}
+
 	var connectErr *proxyConnectHTTPError
 	if !errors.As(err, &connectErr) {
 		t.Fatalf("expected proxyConnectHTTPError, got %v", err)
 	}
+
 	if rebuilds.Load() != 0 {
 		t.Fatalf("expected no rebuilds, got %d", rebuilds.Load())
 	}
+
 	if session.closeCount.Load() != 0 {
 		t.Fatalf("expected current session to remain open, got close count %d", session.closeCount.Load())
 	}
+
 	if !controller.current.accepting {
 		t.Fatal("expected current session to remain accepting")
 	}
@@ -1786,7 +2105,9 @@ func TestProxyControllerStopsAfterThreeOpenTunnelRebuilds(t *testing.T) {
 			accepting: true,
 		},
 	}
+
 	var rebuilds atomic.Int32
+
 	controller.refreshSession = func() error {
 		n := rebuilds.Add(1)
 		controller.swapSession(
@@ -1794,6 +2115,7 @@ func TestProxyControllerStopsAfterThreeOpenTunnelRebuilds(t *testing.T) {
 			fmt.Sprintf("rebuilt-token-%d", n),
 			time.Now().Add(20*time.Minute),
 		)
+
 		return nil
 	}
 
@@ -1801,6 +2123,7 @@ func TestProxyControllerStopsAfterThreeOpenTunnelRebuilds(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected OpenTunnel to fail")
 	}
+
 	if rebuilds.Load() != maxOpenTunnelRebuildRetries {
 		t.Fatalf("expected %d rebuilds, got %d", maxOpenTunnelRebuildRetries, rebuilds.Load())
 	}
@@ -1816,9 +2139,12 @@ func TestProxyControllerKeepsRebuildErrorWhenSessionUnavailable(t *testing.T) {
 			accepting: true,
 		},
 	}
+
 	var rebuilds atomic.Int32
+
 	controller.refreshSession = func() error {
 		rebuilds.Add(1)
+
 		return errors.New("refresh token rejected")
 	}
 
@@ -1826,9 +2152,11 @@ func TestProxyControllerKeepsRebuildErrorWhenSessionUnavailable(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected OpenTunnel to fail")
 	}
+
 	if !strings.Contains(err.Error(), "refresh token rejected") {
 		t.Fatalf("expected rebuild error to be preserved, got %v", err)
 	}
+
 	if rebuilds.Load() != maxOpenTunnelRebuildRetries {
 		t.Fatalf("expected %d rebuilds, got %d", maxOpenTunnelRebuildRetries, rebuilds.Load())
 	}
@@ -1847,17 +2175,21 @@ func TestProxyControllerSkipsRebuildWhenSessionAlreadyReplaced(t *testing.T) {
 		},
 	}
 	failed := controller.current
-	controller.swapSession(newSession, "new-token", time.Now().Add(20*time.Minute))
+	controller.swapSession(newSession, fixtureTokenNew, time.Now().Add(20*time.Minute))
 
 	var rebuilds atomic.Int32
+
 	controller.refreshSession = func() error {
 		rebuilds.Add(1)
+
 		return nil
 	}
 
-	if err := controller.rebuildSession(failed); err != nil {
+	err := controller.rebuildSession(failed)
+	if err != nil {
 		t.Fatalf("rebuildSession returned error: %v", err)
 	}
+
 	if rebuilds.Load() != 0 {
 		t.Fatalf("expected rebuild to be skipped, got %d rebuilds", rebuilds.Load())
 	}
@@ -1867,12 +2199,15 @@ func TestProxyControllerSleepOrDoneWakesOnClose(t *testing.T) {
 	t.Parallel()
 
 	controller := &proxyController{done: make(chan struct{})}
+
 	done := make(chan bool, 1)
+
 	go func() {
 		done <- controller.sleepOrDone(time.Hour)
 	}()
 
-	if err := controller.Close(); err != nil {
+	err := controller.Close()
+	if err != nil {
 		t.Fatalf("Close returned error: %v", err)
 	}
 
@@ -1903,20 +2238,26 @@ func TestProxyControllerWritesStatusFile(t *testing.T) {
 	controller.writeStatus("startup")
 	controller.writeStatus("renewed")
 
-	data, err := os.ReadFile(statusFile)
+	data, err := os.ReadFile(statusFile) //nolint:gosec // G304: statusFile is a t.TempDir fixture
 	if err != nil {
 		t.Fatalf("ReadFile returned error: %v", err)
 	}
+
 	var status proxyRuntimeStatus
-	if err := json.Unmarshal(data, &status); err != nil {
+
+	err = json.Unmarshal(data, &status)
+	if err != nil {
 		t.Fatalf("json.Unmarshal returned error: %v", err)
 	}
+
 	if status.Reason != "renewed" {
 		t.Fatalf("expected reason renewed, got %q", status.Reason)
 	}
+
 	if status.ProxyPassExpiresAt == "" {
 		t.Fatal("expected proxy_pass_expires_at to be populated")
 	}
+
 	if !status.Accepting {
 		t.Fatal("expected accepting=true")
 	}
@@ -1930,8 +2271,9 @@ func TestProxyControllerRenewWithTimeoutTimesOut(t *testing.T) {
 	defer controller.renewMu.Unlock()
 
 	timedOutCh := make(chan bool, 1)
+
 	go func() {
-		_, timedOut := controller.renewWithTimeout(20 * time.Millisecond)
+		timedOut, _ := controller.renewWithTimeout(20 * time.Millisecond)
 		timedOutCh <- timedOut
 	}()
 
@@ -1951,7 +2293,7 @@ func TestProxyControllerRenewWithTimeoutStopsWhenClosed(t *testing.T) {
 	controller := &proxyController{done: make(chan struct{})}
 	close(controller.done)
 
-	_, timedOut := controller.renewWithTimeout(time.Hour)
+	timedOut, _ := controller.renewWithTimeout(time.Hour)
 	if timedOut {
 		t.Fatal("expected closed controller not to report renewal timeout")
 	}
@@ -1961,8 +2303,11 @@ func TestLoadSessionTokenPool(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "tokens.txt")
+
 	content := "token-a\r\n\n# comment line\ntoken-b\n   token-a   \ntoken-c\n"
-	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+
+	err := os.WriteFile(path, []byte(content), 0600)
+	if err != nil {
 		t.Fatalf("writing token file: %v", err)
 	}
 
@@ -1970,23 +2315,27 @@ func TestLoadSessionTokenPool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadSessionTokenPool returned error: %v", err)
 	}
+
 	if pool.size() != 3 {
 		t.Fatalf("expected 3 tokens (duplicates skipped), got %d", pool.size())
 	}
 
 	want := []string{"token-a", "token-b", "token-c"}
-	for i, expected := range want {
+	for position, expected := range want {
 		token, index, total, ok := pool.next()
 		if !ok {
-			t.Fatalf("pool exhausted early at position %d", i)
+			t.Fatalf("pool exhausted early at position %d", position)
 		}
+
 		if token != expected {
-			t.Fatalf("expected token %q at position %d, got %q", expected, i, token)
+			t.Fatalf("expected token %q at position %d, got %q", expected, position, token)
 		}
-		if index != i+1 || total != len(want) {
-			t.Fatalf("expected position %d/%d, got %d/%d", i+1, len(want), index, total)
+
+		if index != position+1 || total != len(want) {
+			t.Fatalf("expected position %d/%d, got %d/%d", position+1, len(want), index, total)
 		}
 	}
+
 	if _, _, _, ok := pool.next(); ok {
 		t.Fatal("expected pool to be exhausted after all tokens consumed")
 	}
@@ -1996,10 +2345,14 @@ func TestLoadSessionTokenPoolRejectsEmptyFile(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "tokens.txt")
-	if err := os.WriteFile(path, []byte("# only comments\n\n"), 0600); err != nil {
+
+	err := os.WriteFile(path, []byte("# only comments\n\n"), 0600)
+	if err != nil {
 		t.Fatalf("writing token file: %v", err)
 	}
-	if _, err := loadSessionTokenPool(path); err == nil {
+
+	_, err = loadSessionTokenPool(path)
+	if err == nil {
 		t.Fatal("expected error for file without tokens")
 	}
 }
@@ -2029,8 +2382,11 @@ func TestSessionTokenPoolPersistsActivationState(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
+
 	path := filepath.Join(dir, "tokens.txt")
-	if err := os.WriteFile(path, []byte("token-a\ntoken-b\ntoken-c\n"), 0600); err != nil {
+
+	err := os.WriteFile(path, []byte("token-a\ntoken-b\ntoken-c\n"), 0600)
+	if err != nil {
 		t.Fatalf("writing token file: %v", err)
 	}
 
@@ -2038,15 +2394,20 @@ func TestSessionTokenPoolPersistsActivationState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadSessionTokenPool returned error: %v", err)
 	}
+
 	if pool.resumedIndex() != 0 {
 		t.Fatalf("expected no resumed token on first load, got %d", pool.resumedIndex())
 	}
+
 	pool.saveState(2) // token-b was the last activated
 
-	if _, err := os.Stat(path + ".state"); err != nil {
+	_, err = os.Stat(path + ".state")
+	if err != nil {
 		t.Fatalf("state file was not created: %v", err)
 	}
-	if _, err := os.Stat(path + ".state.tmp"); !os.IsNotExist(err) {
+
+	_, err = os.Stat(path + ".state.tmp")
+	if !os.IsNotExist(err) {
 		t.Fatalf("temp state file left behind after atomic write (err=%v)", err)
 	}
 
@@ -2054,9 +2415,11 @@ func TestSessionTokenPoolPersistsActivationState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reloading pool returned error: %v", err)
 	}
+
 	if resumed.resumedIndex() != 2 {
 		t.Fatalf("expected resumed index 2, got %d", resumed.resumedIndex())
 	}
+
 	token, index, _, ok := resumed.next()
 	if !ok || token != "token-b" || index != 2 {
 		t.Fatalf("expected resumed next token token-b at 2, got %q at %d (ok=%v)", token, index, ok)
@@ -2067,26 +2430,35 @@ func TestSessionTokenPoolDiscardsStateWhenFileChanges(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
+
 	path := filepath.Join(dir, "tokens.txt")
-	if err := os.WriteFile(path, []byte("token-a\ntoken-b\n"), 0600); err != nil {
+
+	err := os.WriteFile(path, []byte("token-a\ntoken-b\n"), 0600)
+	if err != nil {
 		t.Fatalf("writing token file: %v", err)
 	}
+
 	pool, err := loadSessionTokenPool(path)
 	if err != nil {
 		t.Fatalf("loadSessionTokenPool returned error: %v", err)
 	}
+
 	pool.saveState(2)
 
-	if err := os.WriteFile(path, []byte("token-a\ntoken-b\ntoken-c\n"), 0600); err != nil {
+	err = os.WriteFile(path, []byte("token-a\ntoken-b\ntoken-c\n"), 0600)
+	if err != nil {
 		t.Fatalf("rewriting token file: %v", err)
 	}
+
 	reloaded, err := loadSessionTokenPool(path)
 	if err != nil {
 		t.Fatalf("reloading pool returned error: %v", err)
 	}
+
 	if reloaded.resumedIndex() != 0 {
 		t.Fatalf("expected state to be discarded after file change, got resumed index %d", reloaded.resumedIndex())
 	}
+
 	if token, _, _, _ := reloaded.next(); token != "token-a" {
 		t.Fatalf("expected first token after file change, got %q", token)
 	}

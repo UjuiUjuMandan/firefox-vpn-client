@@ -1,3 +1,6 @@
+// Package vpnclient implements the Firefox VPN control plane client: FxA
+// login and OAuth tokens, Guardian proxy passes, the Remote Settings server
+// list, and the Fastly anti-bot challenge solver.
 package vpnclient
 
 import (
@@ -32,21 +35,41 @@ const (
 	// fst-post-back ({ch, tok} responses).
 	maxPostBackRounds = 3
 
-	fastlySolverUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+	// fastlySolverUserAgent mirrors the browser user agent the Fastly
+	// challenge script expects.
+	fastlySolverUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+		"(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+
+	// challengeBodyLimit caps one challenge post-back or PAT response body.
+	challengeBodyLimit = 1 << 20
+
+	// pageBodyLimit caps one challenge page or script response body.
+	pageBodyLimit = 2 << 20
+
+	// powSuffixLen is the length of the proof-of-work suffix brute-forced
+	// by solvePow.
+	powSuffixLen = 2
+
+	// clientMetricsVersion is the schema version of the fabricated
+	// browser-metrics payload.
+	clientMetricsVersion = 2
+
+	// truncateLimit bounds the response excerpt embedded in error messages.
+	truncateLimit = 256
 )
+
+// powAlphabet is the character set the Fastly proof-of-work solver
+// brute-forces; it mirrors the challenge script's own alphabet.
+const powAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 var (
 	fastlyChallengePrefixRe = regexp.MustCompile(`/_fs-ch-[A-Za-z0-9]+`)
 	fastlyInitCallRe        = regexp.MustCompile(`init\((\[[^\]]*\]),\s*"([^"]+)",\s*"([^"]+)"`)
 
-	// powAlphabet is the character set the Fastly proof-of-work solver
-	// brute-forces; it mirrors the challenge script's own alphabet.
-	powAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-
 	// challengeSolveMu serializes solving attempts: two concurrent solvers
 	// would race on the control plane client's cookie jar and on the
 	// exit-IP-bound cookie.
-	challengeSolveMu sync.Mutex
+	challengeSolveMu sync.Mutex //nolint:gochecknoglobals // package-level serialization primitive is idiomatic Go
 
 	// errNoChallengePage signals that a host served regular content
 	// instead of a Fastly challenge page.
@@ -56,6 +79,52 @@ var (
 	// on the probe request, typically because the exit IP rotated between
 	// solving and probing.
 	errChallengeNotAccepted = errors.New("challenge cookie not accepted on this exit IP")
+
+	// errChallengePrefixNotFound signals that the challenge page did not
+	// reference the expected /_fs-ch-* asset prefix.
+	errChallengePrefixNotFound = errors.New("challenge asset prefix not found")
+
+	// errChallengePostBackRejected signals a non-OK post-back response.
+	errChallengePostBackRejected = errors.New("challenge post-back rejected")
+
+	// errUnexpectedPostBack signals a post-back response without a new
+	// challenge round or token.
+	errUnexpectedPostBack = errors.New("unexpected post-back response")
+
+	// errChallengeIncomplete signals that the post-back rounds were
+	// exhausted without a success response.
+	//nolint:staticcheck // ST1005: Fastly is a proper noun (anti-bot vendor)
+	errChallengeIncomplete = errors.New("Fastly challenge did not complete")
+
+	// errUnexpectedHTTPStatus signals a non-OK HTTP status from the
+	// challenge edge.
+	errUnexpectedHTTPStatus = errors.New("unexpected HTTP status")
+
+	// errChallengeInitNotFound signals that the challenge script did not
+	// contain the expected init(...) call.
+	errChallengeInitNotFound = errors.New("challenge init call not found in script")
+
+	// errEmptyChallengeList signals an init call with zero challenges.
+	errEmptyChallengeList = errors.New("empty challenge list")
+
+	// errPowUnsolved signals that no proof-of-work suffix matched the
+	// target hash.
+	errPowUnsolved = errors.New("no proof-of-work solution found")
+
+	// errUnsupportedChallengeType signals a challenge type the solver
+	// cannot handle automatically (for example captcha).
+	errUnsupportedChallengeType = errors.New("unsupported Fastly challenge type (captcha cannot be solved automatically)")
+
+	// errPATRejected signals a non-OK PAT endpoint response.
+	errPATRejected = errors.New("PAT request returned an error status")
+
+	// errEmptyPAT signals an empty auth token in an otherwise successful
+	// PAT response.
+	errEmptyPAT = errors.New("empty PAT auth token")
+
+	// errNoCookiesIssued signals that the challenge completed but the
+	// solver jar stayed empty.
+	errNoCookiesIssued = errors.New("challenge completed but no cookies were issued")
 )
 
 type fastlyChallenge struct {
@@ -71,8 +140,8 @@ type fastlyPowData struct {
 }
 
 type fastlyPostBack struct {
-	Token string        `json:"token"`
-	Data  []interface{} `json:"data"`
+	Token string `json:"token"`
+	Data  []any  `json:"data"`
 }
 
 type fastlyPostBackResponse struct {
@@ -98,31 +167,40 @@ func solveFastlyChallenge(ctx context.Context) error {
 	// back to the site host: the API host usually serves no challenge
 	// page at all and the cookie it needs is issued with Domain=firefox.com.
 	var lastErr error
+
 	for _, base := range []string{fxaAPIHost, strings.TrimRight(fxaSiteURL, "/")} {
 		err := solveChallengeOnHost(ctx, base)
 		if err == nil {
 			return nil
 		}
+
 		lastErr = err
+
 		if errors.Is(err, errNoChallengePage) {
 			continue
 		}
 	}
+
 	if lastErr == nil {
 		lastErr = errNoChallengePage
 	}
+
 	return lastErr
 }
 
 // solveChallengeOnHost runs the whole challenge flow against one host using
 // a throw-away client with a fresh cookie jar: re-solving with a client that
 // already holds a valid challenge cookie fails because Fastly then serves
-// the real page instead of the challenge page.
+// the real page instead of the challenge page. Splitting the flow would
+// obscure the request order.
+//
+//nolint:gocognit,cyclop,funlen // sequential protocol flow (page, script, answer, post-back, probe)
 func solveChallengeOnHost(ctx context.Context, base string) error {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("creating solver cookie jar: %w", err)
 	}
+
 	client := &http.Client{
 		Transport: controlPlaneHTTPClient.Transport,
 		Jar:       jar,
@@ -134,13 +212,14 @@ func solveChallengeOnHost(ctx context.Context, base string) error {
 	if err != nil {
 		return err
 	}
+
 	if !isChallenge {
 		return errNoChallengePage
 	}
 
 	prefix := fastlyChallengePrefixRe.FindString(page)
 	if prefix == "" {
-		return fmt.Errorf("challenge asset prefix not found on %s", base)
+		return fmt.Errorf("%w on %s", errChallengePrefixNotFound, base)
 	}
 
 	script, err := fetchText(ctx, client, base+prefix+"/script.js?reload=true")
@@ -153,24 +232,29 @@ func solveChallengeOnHost(ctx context.Context, base string) error {
 		return err
 	}
 
-	for round := 0; round < maxPostBackRounds; round++ {
-		answers := make([]interface{}, 0, len(challenges))
+	for range maxPostBackRounds {
+		answers := make([]any, 0, len(challenges))
+
 		for _, ch := range challenges {
 			answer, err := answerChallenge(ctx, client, base+prefix, token, ch)
 			if err != nil {
 				return err
 			}
+
 			answers = append(answers, answer)
 		}
 
 		postBack, err := json.Marshal(fastlyPostBack{Token: token, Data: answers})
 		if err != nil {
-			return err
+			return fmt.Errorf("marshaling post-back payload: %w", err)
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+prefix+"/fst-post-back", strings.NewReader(string(postBack)))
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			base+prefix+"/fst-post-back", strings.NewReader(string(postBack)))
 		if err != nil {
-			return err
+			return fmt.Errorf("creating post-back request: %w", err)
 		}
+
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", fastlySolverUserAgent)
@@ -180,36 +264,48 @@ func solveChallengeOnHost(ctx context.Context, base string) error {
 		if err != nil {
 			return fmt.Errorf("challenge post-back: %w", err)
 		}
-		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		resp.Body.Close()
+
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, challengeBodyLimit))
+		_ = resp.Body.Close()
+
 		if readErr != nil {
-			return readErr
+			return fmt.Errorf("reading post-back response: %w", readErr)
 		}
+
 		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("challenge post-back returned HTTP %d: %s", resp.StatusCode, truncate(string(data), 256))
+			return fmt.Errorf("%w: HTTP %d: %s",
+				errChallengePostBackRejected, resp.StatusCode, truncate(string(data)))
 		}
 
 		var pbResp fastlyPostBackResponse
-		if err := json.Unmarshal(data, &pbResp); err != nil {
+
+		err = json.Unmarshal(data, &pbResp)
+		if err != nil {
 			return fmt.Errorf("parsing post-back response: %w", err)
 		}
+
 		if pbResp.Status == "success" {
 			// Probe before installing the cookie: with rotating-exit
 			// proxies the cookie may be bound to an IP the API call
 			// will not reuse, and the probe catches that immediately.
-			if _, stillChallenged, err := fetchChallengePage(ctx, client, pageURL); err != nil {
+			_, stillChallenged, err := fetchChallengePage(ctx, client, pageURL)
+			if err != nil {
 				return err
 			} else if stillChallenged {
 				return errChallengeNotAccepted
 			}
+
 			return installChallengeCookies(jar, pageURL)
 		}
+
 		if len(pbResp.Ch) == 0 || pbResp.Tok == "" {
-			return fmt.Errorf("unexpected post-back response: %s", truncate(string(data), 256))
+			return fmt.Errorf("%w: %s", errUnexpectedPostBack, truncate(string(data)))
 		}
+
 		challenges, token = pbResp.Ch, pbResp.Tok
 	}
-	return fmt.Errorf("Fastly challenge did not complete within %d rounds", maxPostBackRounds)
+
+	return fmt.Errorf("%w within %d rounds", errChallengeIncomplete, maxPostBackRounds)
 }
 
 // fetchChallengePage fetches pageURL and reports whether the response is a
@@ -219,30 +315,37 @@ func fetchChallengePage(ctx context.Context, client *http.Client, pageURL string
 	if err != nil {
 		return "", false, err
 	}
+
 	isChallenge := strings.Contains(body, "/_fs-ch-") && strings.Contains(body, "Client Challenge")
+
 	return body, isChallenge, nil
 }
 
 func fetchText(ctx context.Context, client *http.Client, rawURL string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("creating GET request for %s: %w", rawURL, err)
 	}
+
 	req.Header.Set("User-Agent", fastlySolverUserAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("requesting %s: %w", rawURL, err)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	resp.Body.Close()
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, pageBodyLimit))
+	_ = resp.Body.Close()
+
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("reading response of %s: %w", rawURL, err)
 	}
+
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("GET %s returned HTTP %d", rawURL, resp.StatusCode)
+		return "", fmt.Errorf("GET %s: %w: HTTP %d", rawURL, errUnexpectedHTTPStatus, resp.StatusCode)
 	}
+
 	return string(data), nil
 }
 
@@ -251,50 +354,65 @@ func fetchText(ctx context.Context, client *http.Client, rawURL string) (string,
 func parseChallengeInit(script string) ([]fastlyChallenge, string, error) {
 	matches := fastlyInitCallRe.FindAllStringSubmatch(script, -1)
 	if len(matches) == 0 {
-		return nil, "", fmt.Errorf("challenge init call not found in script")
+		return nil, "", errChallengeInitNotFound
 	}
-	m := matches[len(matches)-1]
+
+	initCall := matches[len(matches)-1]
 
 	var challenges []fastlyChallenge
-	if err := json.Unmarshal([]byte(m[1]), &challenges); err != nil {
+
+	err := json.Unmarshal([]byte(initCall[1]), &challenges)
+	if err != nil {
 		return nil, "", fmt.Errorf("parsing challenge list: %w", err)
 	}
+
 	if len(challenges) == 0 {
-		return nil, "", fmt.Errorf("empty challenge list")
+		return nil, "", errEmptyChallengeList
 	}
-	return challenges, m[2], nil
+
+	return challenges, initCall[2], nil
 }
 
 // answerChallenge produces the fst-post-back answer payload for one
 // challenge task.
-func answerChallenge(ctx context.Context, client *http.Client, prefixURL, token string, ch fastlyChallenge) (interface{}, error) {
-	switch ch.Ty {
+func answerChallenge(
+	ctx context.Context,
+	client *http.Client,
+	prefixURL, token string,
+	challenge fastlyChallenge,
+) (any, error) {
+	switch challenge.Ty {
 	case "pow":
-		var d fastlyPowData
-		if err := json.Unmarshal(ch.Data, &d); err != nil {
+		var powData fastlyPowData
+
+		err := json.Unmarshal(challenge.Data, &powData)
+		if err != nil {
 			return nil, fmt.Errorf("parsing pow challenge: %w", err)
 		}
-		answer, ok := solvePow(d.Base, d.Hash)
+
+		answer, ok := solvePow(powData.Base, powData.Hash)
 		if !ok {
-			return nil, fmt.Errorf("no proof-of-work solution found for base %q", d.Base)
+			return nil, fmt.Errorf("%w for base %q", errPowUnsolved, powData.Base)
 		}
-		return map[string]interface{}{
+
+		return map[string]any{
 			"ty":      "pow",
-			"base":    d.Base,
+			"base":    powData.Base,
 			"answer":  answer,
-			"hmac":    d.HMAC,
-			"expires": d.Expires,
+			"hmac":    powData.HMAC,
+			"expires": powData.Expires,
 		}, nil
 	case "pat":
 		auth, err := fetchPAT(ctx, client, prefixURL, token)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]interface{}{"ty": "pat", "auth": auth}, nil
+
+		return map[string]any{"ty": "pat", "auth": auth}, nil
 	case "clientmetrics":
 		return clientMetricsAnswer(), nil
 	default:
-		return nil, fmt.Errorf("unsupported Fastly challenge type %q (captcha cannot be solved automatically)", ch.Ty)
+		return nil, fmt.Errorf("%w: %q", errUnsupportedChallengeType, challenge.Ty)
 	}
 }
 
@@ -306,18 +424,23 @@ func solvePow(base, targetHex string) (string, bool) {
 	if err != nil || len(target) != sha256.Size {
 		return "", false
 	}
-	buf := make([]byte, len(base)+2)
+
+	buf := make([]byte, len(base)+powSuffixLen)
 	copy(buf, base)
-	for i := 0; i < len(powAlphabet); i++ {
+
+	for i := range len(powAlphabet) {
 		buf[len(base)] = powAlphabet[i]
-		for j := 0; j < len(powAlphabet); j++ {
+		for j := range len(powAlphabet) {
 			buf[len(base)+1] = powAlphabet[j]
+
 			sum := sha256.Sum256(buf)
+
 			if bytes.Equal(sum[:], target) {
 				return string(buf[len(base):]), true
 			}
 		}
 	}
+
 	return "", false
 }
 
@@ -327,10 +450,12 @@ func solvePow(base, targetHex string) (string, bool) {
 // back an empty auth, which makes Fastly fall back to solvable challenges.
 func fetchPAT(ctx context.Context, client *http.Client, prefixURL, token string) (string, error) {
 	patURL := prefixURL + "/pat?token=" + url.QueryEscape(token)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, patURL, nil)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("creating PAT request: %w", err)
 	}
+
 	req.Header.Set("Accept", "text/plain")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", fastlySolverUserAgent)
@@ -340,43 +465,51 @@ func fetchPAT(ctx context.Context, client *http.Client, prefixURL, token string)
 	if err != nil {
 		return "", fmt.Errorf("PAT request: %w", err)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	resp.Body.Close()
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, challengeBodyLimit))
+	_ = resp.Body.Close()
+
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("reading PAT response: %w", err)
 	}
+
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusBadRequest {
 		// Aborted PAT (servers answer 401 or 400 depending on client
 		// fingerprint): empty auth triggers the PoW fallback server-side.
 		return "", nil
 	}
+
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("PAT request returned HTTP %d: %s", resp.StatusCode, truncate(string(data), 256))
+		return "", fmt.Errorf("%w: HTTP %d: %s", errPATRejected, resp.StatusCode, truncate(string(data)))
 	}
 
 	var out struct {
 		Auth string `json:"auth"`
 	}
-	if err := json.Unmarshal(data, &out); err != nil {
+
+	err = json.Unmarshal(data, &out)
+	if err != nil {
 		return "", fmt.Errorf("parsing PAT response: %w", err)
 	}
+
 	if out.Auth == "" {
-		return "", fmt.Errorf("empty PAT auth token")
+		return "", errEmptyPAT
 	}
+
 	return out.Auth, nil
 }
 
 // clientMetricsAnswer fabricates a benign browser-metrics payload; Mozilla's
 // configuration currently issues only PAT/PoW challenges, so this path is a
 // best-effort fallback.
-func clientMetricsAnswer() map[string]interface{} {
-	return map[string]interface{}{
+func clientMetricsAnswer() map[string]any {
+	return map[string]any{
 		"ty":                   "clientmetrics",
 		"webdriver":            false,
-		"bot_detection_result": map[string]interface{}{"bot_detected": false, "bot_kind": nil},
-		"browser_metrics":      map[string]interface{}{"client_data": "{}", "error_trace": nil},
-		"detector_results":     map[string]interface{}{},
-		"v":                    2,
+		"bot_detection_result": map[string]any{"bot_detected": false, "bot_kind": nil},
+		"browser_metrics":      map[string]any{"client_data": "{}", "error_trace": nil},
+		"detector_results":     map[string]any{},
+		"v":                    clientMetricsVersion,
 	}
 }
 
@@ -387,27 +520,33 @@ func clientMetricsAnswer() map[string]interface{} {
 func installChallengeCookies(solverJar http.CookieJar, pageURL string) error {
 	parsed, err := url.Parse(pageURL)
 	if err != nil {
-		return err
+		return fmt.Errorf("parsing challenge page URL: %w", err)
 	}
+
 	cookies := solverJar.Cookies(parsed)
 	if len(cookies) == 0 {
-		return fmt.Errorf("challenge completed but no cookies were issued")
+		return errNoCookiesIssued
 	}
 
 	if controlPlaneHTTPClient.Jar == nil {
 		jar, err := cookiejar.New(nil)
 		if err != nil {
-			return err
+			return fmt.Errorf("creating control plane cookie jar: %w", err)
 		}
+
 		controlPlaneHTTPClient.Jar = jar
 	}
+
 	apiURL, err := url.Parse(fxaAuthServer + "/")
 	if err != nil {
-		return err
+		return fmt.Errorf("parsing API URL: %w", err)
 	}
+
 	controlPlaneHTTPClient.Jar.SetCookies(apiURL, cookies)
+
 	parsed2, _ := url.Parse(fxaSiteURL)
 	controlPlaneHTTPClient.Jar.SetCookies(parsed2, cookies)
+
 	return nil
 }
 
@@ -419,8 +558,10 @@ func contextWithMinDeadline(ctx context.Context, d time.Duration) (context.Conte
 	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) >= d {
 		return ctx, func() {}
 	}
+
 	extended, cancel := context.WithTimeout(context.WithoutCancel(ctx), d)
 	watcherDone := make(chan struct{})
+
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -428,17 +569,20 @@ func contextWithMinDeadline(ctx context.Context, d time.Duration) (context.Conte
 		case <-watcherDone:
 		}
 	}()
+
 	return extended, func() {
 		close(watcherDone)
 		cancel()
 	}
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
+// truncate shortens s to the excerpt length used in error messages.
+func truncate(s string) string {
+	if len(s) <= truncateLimit {
 		return s
 	}
-	return s[:n] + "..."
+
+	return s[:truncateLimit] + "..."
 }
 
 // baseOrigin derives the Origin header value for challenge requests from a
@@ -447,5 +591,6 @@ func baseOrigin(prefixURL string) string {
 	if idx := strings.Index(prefixURL, "/_fs-ch-"); idx > 0 {
 		return prefixURL[:idx]
 	}
+
 	return prefixURL
 }
