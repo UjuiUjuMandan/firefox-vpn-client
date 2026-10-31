@@ -1,0 +1,13 @@
+{
+  // Project README uses shields badge rows wrapped in <div align="center">,
+  // a centered bold tagline, and long table/code lines, following the
+  // maintained README style (mirrors the cindex .markdownlint-cli2.jsonc).
+  // MD051: GitHub anchors strip emoji, markdownlint cannot validate them.
+  // MD036: the centered bold tagline is part of the README style.
+  "config": {
+    "MD013": false,
+    "MD033": false,
+    "MD036": false,
+    "MD051": false
+  }
+}
