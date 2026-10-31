@@ -173,6 +173,7 @@ func main() {
 	}
 
 	apiProxyFlag := flag.String("api-proxy", "", "Optional HTTP/HTTPS/SOCKS5 proxy for Firefox Accounts, Guardian, and Remote Settings API requests")
+	fxaUserAgentFlag := flag.String("fxa-user-agent", "", "Override the Firefox User-Agent for FxA and its challenge solver; empty uses the pinned stable Firefox identity")
 	guardianFlag := flag.String("guardian", vpnclient.GuardianEndpointDefault, "Guardian API endpoint")
 	listenFlag := flag.String("listen", "127.0.0.1:1080", "Local SOCKS5 listen address")
 	loginFlag := flag.Bool("login", false, "Force fresh login (ignore saved refresh token)")
@@ -194,6 +195,10 @@ func main() {
 	verboseFlag := flag.Bool("verbose", false, "Enable verbose per-connection logs, including CONNECT target hosts")
 	flag.Parse()
 	verboseLogs = *verboseFlag
+	if err := vpnclient.SetFxAUserAgent(*fxaUserAgentFlag); err != nil {
+		logError("invalid -fxa-user-agent: %v", err)
+		os.Exit(1)
+	}
 	if err := configureAPIProxy(strings.TrimSpace(*apiProxyFlag)); err != nil {
 		logError("invalid -api-proxy: %s", logErr(err))
 		os.Exit(1)

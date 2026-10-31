@@ -239,7 +239,7 @@ func fxaLoginAttempt(ctx context.Context, email, password, verificationMethod st
 			return nil, fmt.Errorf("creating login request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
-		applyMozillaVPNHeaders(req)
+		applyFxAHeaders(req)
 		return req, nil
 	})
 	if err != nil {
@@ -283,7 +283,7 @@ func fxaVerifySession(ctx context.Context, sessionToken, code string) error {
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", authHeader)
-		applyMozillaVPNHeaders(req)
+		applyFxAHeaders(req)
 		return req, nil
 	})
 	if err != nil {
@@ -325,7 +325,7 @@ func fxaOAuthToken(ctx context.Context, sessionToken string) (*TokenResponse, er
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", authHeader)
-		applyMozillaVPNHeaders(req)
+		applyFxAHeaders(req)
 		return req, nil
 	})
 	if err != nil {
@@ -365,7 +365,7 @@ func fxaRefreshToken(ctx context.Context, refreshToken string) (*TokenResponse, 
 			return nil, fmt.Errorf("creating refresh request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
-		applyMozillaVPNHeaders(req)
+		applyFxAHeaders(req)
 		return req, nil
 	})
 	if err != nil {

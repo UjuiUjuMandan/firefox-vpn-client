@@ -1,0 +1,46 @@
+name: Update Firefox identity
+
+on:
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-firefox-identity
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
+      - run: python3 -B scripts/update_firefox_version.py
+      # GITHUB_TOKEN-created PRs do not trigger pull_request workflows. Run the
+      # same offline gates here before opening/updating the PR; never auto-merge.
+      - run: go test -race ./...
+      - run: go vet ./...
+      - uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
+        with:
+          branch: automation/firefox-identity
+          add-paths: firefox_identity.go
+          commit-message: 'chore: update pinned Firefox identity'
+          title: 'chore: update pinned Firefox identity'
+          body: |
+            Updates the pinned desktop Firefox identity from Mozilla's stable-release metadata:
+            https://product-details.mozilla.org/1.0/firefox_versions.json
+
+            Offline Go race tests, go vet, and updater tests passed in the update workflow.
+            Live FxA checks are opt-in and are not run by this workflow.
+            Review and merge manually; deployed binaries retain their build's pinned identity.
+          delete-branch: true

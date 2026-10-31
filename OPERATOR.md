@@ -46,6 +46,7 @@ go run ./cmd/proxy-demo -country US -listen 127.0.0.1:1088
 -upstream-conns 1             # 上游 proxy session 数量；单用户/sing-box 建议保持 1
 -session-token PATH_OR_TOKEN  # 单个 session token，或每行一个 token 的 .txt 文件（token 池）
 -status-file PATH             # 写入运行状态，systemd 健康检查用来判断 proxy pass 是否过期
+-fxa-user-agent UA            # 覆盖 FxA 请求使用的 Firefox User-Agent；默认用代码内固定的稳定版 Firefox 身份
 -verbose                      # 打印完整 CONNECT 目标，默认会打码
 ```
 
@@ -256,7 +257,7 @@ target=<redacted; use -verbose>
 
 `Fastly anti-bot challenge ...` / HTTP 406
 
-FxA API 被边缘反爬拦截。程序会自动解挑战（最多 5 次），失败通常因为出口 IP 轮换导致 cookie 失效——配合 `-api-proxy` 使用固定出口的控制代理可缓解。
+FxA API 被边缘反爬拦截。程序会自动解挑战（最多 5 次）。FxA 请求和挑战求解统一使用代码内固定的桌面 Firefox User-Agent（`firefox_identity.go`，随 GitHub Actions 定期跟进稳定版并开 PR），不要再对 FxA 域名改写 UA。若仍持续 406，通常因为出口 IP 轮换导致 cookie 失效——配合 `-api-proxy` 使用固定出口的控制代理可缓解；排查时可用 `-fxa-user-agent` 临时覆盖身份对比，但不要长期偏离 Firefox 形态。
 
 `no session tokens left in the pool`
 

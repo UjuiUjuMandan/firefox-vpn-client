@@ -31,8 +31,6 @@ const (
 	// maxPostBackRounds caps follow-up challenge rounds returned by
 	// fst-post-back ({ch, tok} responses).
 	maxPostBackRounds = 3
-
-	fastlySolverUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 
 var (
@@ -173,7 +171,7 @@ func solveChallengeOnHost(ctx context.Context, base string) error {
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("User-Agent", fastlySolverUserAgent)
+		req.Header.Set("User-Agent", fxaUserAgent())
 		req.Header.Set("Origin", baseOrigin(base+prefix))
 
 		resp, err := client.Do(req)
@@ -228,7 +226,7 @@ func fetchText(ctx context.Context, client *http.Client, rawURL string) (string,
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", fastlySolverUserAgent)
+	req.Header.Set("User-Agent", fxaUserAgent())
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
 	resp, err := client.Do(req)
@@ -333,7 +331,7 @@ func fetchPAT(ctx context.Context, client *http.Client, prefixURL, token string)
 	}
 	req.Header.Set("Accept", "text/plain")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fastlySolverUserAgent)
+	req.Header.Set("User-Agent", fxaUserAgent())
 	req.Header.Set("Origin", baseOrigin(prefixURL))
 
 	resp, err := client.Do(req)
