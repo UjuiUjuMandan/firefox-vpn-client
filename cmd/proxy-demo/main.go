@@ -1415,9 +1415,7 @@ func configureAPIProxy(raw string) error {
 	}
 
 	dialer := &net.Dialer{Timeout: apiProxyDialTimeout}
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
-	}
+	transport := vpnclient.NewControlPlaneTransport()
 
 	switch parsed.Scheme {
 	case "http", "https":
