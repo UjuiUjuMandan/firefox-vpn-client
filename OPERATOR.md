@@ -257,7 +257,7 @@ target=<redacted; use -verbose>
 
 `Fastly anti-bot challenge ...` / HTTP 406
 
-FxA API 被边缘反爬拦截。程序会自动解挑战（最多 5 次）。FxA 请求和挑战求解统一使用代码内固定的桌面 Firefox User-Agent（`firefox_identity.go`，随 GitHub Actions 定期跟进稳定版并开 PR），不要再对 FxA 域名改写 UA。2026-11 起边缘还会按 HTTP/2 客户端指纹拒绝 Go 默认 h2 栈（406 与 UA、cookie 无关），控制面已固定 HTTP/1.1（`NewControlPlaneTransport`），上游数据面（h3/h2 CONNECT）不受影响。若仍持续 406，通常因为出口 IP 轮换导致 cookie 失效——配合 `-api-proxy` 使用固定出口的控制代理可缓解；排查时可用 `-fxa-user-agent` 临时覆盖身份对比，但不要长期偏离 Firefox 形态。
+FxA API 被边缘反爬拦截。程序会自动解挑战（最多 5 次）。FxA 请求和挑战求解统一使用代码内固定的桌面 Firefox User-Agent（`firefox_identity.go`，随 GitHub Actions 定期跟进稳定版并开 PR），不要再对 FxA 域名改写 UA。2026-11 起边缘还对 VPN scope 的 token 请求按 **TLS ClientHello 指纹**做严查（Go `crypto/tls` 的签名在黑名单上，406 与 UA、cookie、HTTP 版本无关），控制面直连因此改用 uTLS Firefox ClientHello 并走 HTTP/2（`NewControlPlaneTransport`）。注意 `-api-proxy` 路径仍是 Go TLS + HTTP/1.1，若该路径被拦，改用固定出口的控制代理。若仍持续 406，通常因为出口 IP 轮换导致 cookie 失效；排查时可用 `-fxa-user-agent` 临时覆盖身份对比，但不要长期偏离 Firefox 形态。
 
 `no session tokens left in the pool`
 

@@ -1415,7 +1415,14 @@ func configureAPIProxy(raw string) error {
 	}
 
 	dialer := &net.Dialer{Timeout: apiProxyDialTimeout}
-	transport := vpnclient.NewControlPlaneTransport()
+	// The proxied path keeps a plain net/http transport with the HTTP/1.1
+	// pin: net/http performs the TLS handshake itself over the proxied
+	// socket with Go's ClientHello (see NewControlPlaneTransport docs).
+	transport := &http.Transport{
+		ForceAttemptHTTP2: false,
+		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}},
+		TLSNextProto:      map[string]func(authority string, c *tls.Conn) http.RoundTripper{},
+	}
 
 	switch parsed.Scheme {
 	case "http", "https":
