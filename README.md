@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Unofficial Go client for the Mozilla VPN proxy network**
+**Unofficial Go client for the Firefox VPN proxy network**
 
 Logs in to Firefox Accounts, fetches a Guardian proxy pass, and exposes a local SOCKS5 CONNECT proxy over upstream HTTP/2 or HTTP/3 VPN sessions — with a built-in Fastly anti-bot challenge solver and automatic session token rotation.
 
@@ -82,7 +82,7 @@ Control-plane startup flow:
 2. Unverified logins are confirmed with a code emailed by Firefox Accounts (or the confirmation link, when FxA chooses that method), then exchanged for OAuth access and refresh tokens with the `profile https://identity.mozilla.com/apps/vpn` scope.
 3. FxA API requests answered with HTTP 406 are transparently retried after solving the Fastly anti-bot client challenge and carrying the earned cookie (see [Fastly Anti-Bot Challenge](#-fastly-anti-bot-challenge)).
 4. The Guardian API returns a proxy pass (a JWT) plus monthly quota headers. A rejected token triggers an OAuth refresh and account activation; an exhausted quota rotates the session token pool (see [Session Token Pool](#-session-token-pool)).
-5. The Mozilla VPN server list is fetched from Remote Settings, and `-country`, `-proxy`, or `-proxy-state-file` selects the upstream CONNECT proxy (see [Server List & Location Selection](#-server-list--location-selection)).
+5. The Firefox VPN server list is fetched from Remote Settings, and `-country`, `-proxy`, or `-proxy-state-file` selects the upstream CONNECT proxy (see [Server List & Location Selection](#-server-list--location-selection)).
 6. One or more upstream sessions are established — HTTP/2 over TLS by default, HTTP/3 over QUIC with `-h3` — and a background loop renews the proxy pass 2 minutes before expiry.
 
 Data-plane flow:
@@ -105,7 +105,7 @@ firefox-vpn-client/
 ├── fxa.go                         Firefox Accounts login, email 2FA, OAuth tokens, Hawk auth
 ├── guardian.go                    Guardian proxy passes, activation, quota headers
 ├── tokens.go                      OAuth token persistence (0600, atomic replace)
-├── serverlist.go                  Mozilla VPN server list from Remote Settings
+├── serverlist.go                  Firefox VPN server list from Remote Settings
 ├── http_client.go                 Shared control-plane HTTP client with cookie jar
 ├── http_headers.go                MozillaVPN User-Agent and Accept headers
 ├── scripts/
@@ -291,7 +291,7 @@ All flags from `cmd/proxy-demo/main.go`:
 
 | Flag | Default | Description |
 | :-- | :-- | :-- |
-| `-country` | *(empty)* | Mozilla VPN location country code or name used when selecting an upstream proxy |
+| `-country` | *(empty)* | Firefox VPN location country code or name used when selecting an upstream proxy |
 | `-proxy` | *(empty)* | Exact upstream proxy URL or `host:port`; mutually exclusive with `-country` |
 | `-listen` | `127.0.0.1:1080` | Local SOCKS5 listen address |
 | `-login` | `false` | Force fresh login (ignore saved refresh token) |
@@ -319,7 +319,7 @@ All flags from `cmd/proxy-demo/main.go`:
 ### 1. Prerequisites
 
 - Go 1.25 or newer.
-- A Firefox Account you own with access to the Mozilla VPN proxy (the Guardian
+- A Firefox Account you own with access to the Firefox VPN proxy (the Guardian
   entitlement — the same account where VPN works in the Firefox browser).
 - Any platform with a Go toolchain can build and run the client; the systemd
   helper is Linux-only.
