@@ -8,7 +8,7 @@ import (
 
 // Updated from Mozilla's stable-release metadata by the version-update workflow.
 // Keep this pinned: authentication must not depend on a version lookup at startup.
-const defaultFirefoxVersion = "159.0.1"
+const defaultFirefoxVersion = "160.0"
 
 // Use one desktop identity even on routers; do not invent architecture-specific
 // Firefox variants. This matches the desktop Linux platform in nsHttpHandler.cpp.
